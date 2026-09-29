@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "AskLocal",
+  "description": "Ask a local or configured LLM about posts directly inside X.",
+  "version": "0.4.0",
+  "permissions": [
+    "storage",
+    "unlimitedStorage",
+    "tabs",
+    "scripting",
+    "offscreen"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "_comment": "Source metadata only. Load the built package from build/chrome or build/firefox after npm run build:chrome / build:firefox."
+}

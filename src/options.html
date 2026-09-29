@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>AskLocal Settings</title>
+    <link rel="stylesheet" href="settings.css">
+  </head>
+  <body>
+    <main class="settings">
+      <header>
+        <h1>AskLocal Settings</h1>
+        <p>Configure named models and what context AskLocal can use.</p>
+      </header>
+
+      <section>
+        <h2>Models</h2>
+        <p class="hint">Add named provider configs and pick which one is the active main text model. Models marked usable as main text appear in the AskLocal page selector.</p>
+        <div id="modelsList" class="models-list"></div>
+        <datalist id="modelSuggestions"></datalist>
+        <div class="actions-row">
+          <button id="addModel" type="button" class="secondary">Add model</button>
+        </div>
+        <label>
+          <span>Active main text model</span>
+          <select id="activeMainModelId"></select>
+        </label>
+        <label class="check"><input id="streamResponses" type="checkbox"> Stream responses as they generate</label>
+        <p class="hint">Shows the answer word by word as the model writes it. Status updates (searching, reading pages, analyzing media) are shown either way. Disable to receive each answer in one piece.</p>
+        <label class="check"><input id="saveChatHistory" type="checkbox"> Save chat history on this device</label>
+        <p class="hint">Stores AskLocal chats locally in the extension (not synced). Turn off to stop saving new chats. Use Clear in the AskLocal History drawer to delete existing ones.</p>
+        <div class="actions-row">
+          <button id="testConnection" type="button" class="secondary">Test connection</button>
+          <span id="testStatus" class="hint"></span>
+        </div>
+        <p class="hint">Tests the active main text model’s provider connection and fills API model suggestions for the list below.</p>
+      </section>
+
+      <section>
+        <h2>Context</h2>
+        <label class="check"><input id="includeCurrentTweet" type="checkbox"> Current post</label>
+        <label class="check"><input id="includeVisibleThread" type="checkbox"> Same post page visible thread posts</label>
+        <label class="check"><input id="includeQuotedTweet" type="checkbox"> Quoted post</label>
+        <label class="check"><input id="autoReadLinks" type="checkbox"> Auto-read linked articles from posts</label>
+        <label class="check"><input id="cacheVisitedProfiles" type="checkbox"> Cache profiles I visit</label>
+        <label class="check"><input id="allowBackgroundProfileScan" type="checkbox"> Allow background X tabs for extra profile context</label>
+        <label>
+          <span>Recent profile posts</span>
+          <input id="maxRecentProfilePosts" type="number" min="1" max="10">
+        </label>
+        <label class="check"><input id="allowBackgroundSearch" type="checkbox"> Allow background search when more context is needed</label>
+        <p class="hint">When enabled, AskLocal may briefly open hidden search tabs, read the visible result snippets/posts, then close them.</p>
+        <label>
+          <span>Search source</span>
+          <select id="backgroundSearchSource">
+            <option value="x">X search</option>
+            <option value="web">Web search</option>
+            <option value="both">X and web search</option>
+          </select>
+        </label>
+        <label>
+          <span>Web search engines</span>
+          <select id="webSearchEngines" multiple size="6">
+            <option value="brave">Brave</option>
+            <option value="duckduckgo">DuckDuckGo</option>
+            <option value="startpage">Startpage</option>
+            <option value="google">Google</option>
+            <option value="bing">Bing</option>
+            <option value="custom">Custom…</option>
+          </select>
+        </label>
+        <p class="hint">AskLocal uses one universal link extractor across every engine, so any selection works. Pick one or more; priority runs top to bottom. Google and Bing open a brief background tab to render their results.</p>
+        <label id="webSearchCustomTemplateLabel">
+          <span>Custom search URL (use {q} for the query)</span>
+          <input id="webSearchCustomTemplate" type="url" placeholder="https://example.com/search?q={q}">
+        </label>
+        <label>
+          <span>Max search results per source</span>
+          <input id="maxBackgroundSearchResults" type="number" min="1" max="12">
+        </label>
+        <p class="hint">This limit applies separately to each enabled source. If source is Both, AskLocal may collect up to this many X posts and this many web results.</p>
+        <label>
+          <span>Max tool turns</span>
+          <input id="maxToolTurns" type="number" min="1" max="50">
+        </label>
+        <p class="hint">How many rounds of tool calls (search, get, analyze) the model can make before being asked to answer from gathered context. Higher allows deeper research but takes longer; small local models rarely need more than 6.</p>
+        <label>
+          <span>Max multi-links per turn (1–8)</span>
+          <input id="maxMultiLinks" type="number" min="1" max="8" step="1">
+        </label>
+        <p class="hint">How many posts/pages the model may open in one research turn (batch get or several get calls together). The model is told this limit. Cached re-reads do not count.</p>
+        <label>
+          <span>Model context length (tokens)</span>
+          <input id="modelContextTokens" type="number" min="2048" max="262144" step="1024">
+        </label>
+        <p class="hint">Set this to the context length your model server actually uses (LM Studio: the loaded model's Context Length; llama-server: -c; Ollama: num_ctx / OLLAMA_CONTEXT_LENGTH). AskLocal fits the system prompt, tools, chat history, post context, and tool results inside it, trims the least important context first, and leaves room for the answer. If it is set higher than the server's real limit, some servers silently cut the prompt.</p>
+        <label>
+          <span>Temperature</span>
+          <input id="temperature" type="number" min="0" max="2" step="0.05" placeholder="provider default">
+        </label>
+        <p class="hint">Lower keeps answers closer to the sources (0.2–0.4 suits most local models). Leave empty to use the provider's default. Models that only accept their default temperature are detected and retried without it.</p>
+      </section>
+
+      <section>
+        <h2>Media Analysis</h2>
+        <label class="check"><input id="allowImageAnalysis" type="checkbox"> Allow image analysis tools</label>
+        <label>
+          <span>Image model</span>
+          <select id="imageModelId"></select>
+        </label>
+        <p id="imageProviderHint" class="hint">Uses a model from your list above. Prefer a vision-capable model.</p>
+
+        <div class="section-divider"></div>
+
+        <label class="check"><input id="allowVideoAnalysis" type="checkbox"> Allow video analysis tools</label>
+        <label>
+          <span>Video model</span>
+          <select id="videoModelId"></select>
+        </label>
+        <label>
+          <span>Video merge model</span>
+          <select id="videoMergeModelId"></select>
+        </label>
+        <p id="videoMergeProviderHint" class="hint">Used only for the text-only merge when Parallel video chunks is above 1. Prefer a larger-context text model; vision models often cannot fit the merge prompt.</p>
+        <label>
+          <span>Max sampled video frames (0 = no limit)</span>
+          <input id="maxVideoFrames" type="number" min="0" step="1">
+        </label>
+        <label>
+          <span>Video frames per minute (0 = off, scales with length)</span>
+          <input id="videoFramesPerMinute" type="number" min="0" step="1">
+        </label>
+        <label>
+          <span>Video frame interval in seconds</span>
+          <input id="videoFrameIntervalSeconds" type="number" min="0.2" max="30" step="0.05">
+        </label>
+        <label>
+          <span>Seconds per video chunk (10–60)</span>
+          <input id="videoChunkSeconds" type="number" min="10" max="60" step="1">
+        </label>
+        <label>
+          <span>Parallel video chunks (1–8)</span>
+          <input id="videoChunkConcurrency" type="number" min="1" max="8" step="1">
+        </label>
+        <p id="videoProviderHint" class="hint">Uses a model from your list above. Prefer a vision-capable model.</p>
+        <p class="hint">Videos are sent as timestamped image arrays plus detected subtitles. Near-duplicate frames are culled before analysis. Defaults favor token efficiency (1s interval, 12 frames/min, max 36). Lower intervals capture more detail and cost more; the minimum is 0.2 seconds. Set max sampled video frames to 0 for no limit. Frames per minute scales the frame count with video length, then capped by the max sampled frames limit; use 0 to rely on the interval only. Seconds per video chunk splits longer clips into time windows (default 30s). Parallel video chunks = 1 analyzes windows in order with continuity notes (no extra merge). Values above 1 analyze multiple windows at once with the Video model, then the Video merge model (text-only, defaults to your main text model) unifies them.</p>
+
+        <div class="section-divider"></div>
+
+        <label class="check"><input id="allowAudioAnalysis" type="checkbox"> Allow audio analysis (with video)</label>
+        <label>
+          <span>Audio model</span>
+          <select id="audioModelId"></select>
+        </label>
+        <p id="audioProviderHint" class="hint">Uses a model from your list above. Prefer an OpenAI-compatible model that accepts audio input.</p>
+        <p class="hint">When video analysis runs, AskLocal extracts audio when subtitle coverage is weak or missing, and analyzes it alongside the visuals. Solid detected captions skip the separate audio pass to save tokens. One merge pass (Video merge model) combines both into a single audiovisual report when audio runs. Audio windows follow Seconds per video chunk. Requires an OpenAI-compatible audio-input model.</p>
+      </section>
+
+      <footer>
+        <button id="save" type="button">Save</button>
+        <span id="status"></span>
+      </footer>
+    </main>
+    <script src="options.js"></script>
+  </body>
+</html>

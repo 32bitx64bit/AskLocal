@@ -1,0 +1,20 @@
+{
+  "name": "asklocal",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Ask a local or configured LLM about posts directly inside X.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/package.mjs",
+    "build:chrome": "node scripts/package.mjs --browser=chrome",
+    "build:firefox": "node scripts/package.mjs --browser=firefox",
+    "build-chrome": "node scripts/package.mjs --browser=chrome",
+    "build-firefox": "node scripts/package.mjs --browser=firefox",
+    "watch:chrome": "node scripts/package.mjs --browser=chrome --watch"
+  },
+  "devDependencies": {
+    "acorn": "^8.17.0",
+    "acorn-walk": "^8.3.5",
+    "esbuild": "^0.25.5"
+  }
+}
