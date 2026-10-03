@@ -358,8 +358,11 @@
   // Stricter subset used for dialogs: a modal over a normal page is only a challenge
   // when it says so unambiguously (cookie banners and sign-in prompts must not match).
   const MODAL_CHALLENGE_TEXT_RE = /i.?m not a robot|not a (?:robot|bot)\b|prove you(?: are|.?re)(?: a)? human|verify (?:you are|you.?re)(?: a)? human|confirm you.?re (?:a )?human|human verification|bot (?:check|detection)/i;
-  const SOLVING_TEXT_RE = /\bverifying\b|verification complete|redirected to/i;
-  const AUTO_SOLVE_TEXT_RE = /checking your browser|just a moment|verifying(?: you are human)?|making sure you.?re not a bot|performing security (?:check|verification)|this (?:may|won.?t) take (?:a )?few seconds|proof of work/i;
+  // Progress phrases a check shows once it is actually computing. Deliberately
+  // stricter than "verifying": a challenge page whose own heading says
+  // "Verifying you're not a bot" is waiting for us, not working for us.
+  const SOLVING_TEXT_RE = /\bverifying you(?: are|.?re) human\b|verification (?:in progress|complete)|redirect(?:ed|ing) to/i;
+  const AUTO_SOLVE_TEXT_RE = /checking your browser|just a moment|verifying you(?: are|.?re) human|making sure you.?re not a bot|performing security (?:check|verification)|this (?:may|won.?t) take (?:a )?few seconds|proof of work/i;
   const CLICK_TEXT_RE = /i.?m not a robot|verify (?:you are|you.?re)(?: a)? human|verify(?: to continue)?|^verify$|begin(?: verification)?|start(?: verification)?|^continue$|confirm(?: you.?re human)?|pass(?: the)? check/i;
   const CLICK_SKIP_RE = /traditional captcha|privacy|terms|cookie|accept all|reject all|manage (?:cookies|options)|learn more|switch to|sign in|log in|subscribe/i;
   const PUZZLE_SELECTOR = [
@@ -380,6 +383,11 @@
   // it has to be recognised by the dialog and its verify button.
   const MODAL_SELECTOR = "dialog[open], [role='dialog'], [role='alertdialog'], [aria-modal='true']";
   const POW_BUTTON_SELECTOR = "button[name='captcha-button'], [data-captcha-button]";
+  // Brave's current full-page check (HTTP 429) is a jigsaw drag-slider built from
+  // two canvases: there is no button to press, only a piece a person must drag
+  // into the gap. Synthetic pointer events do not move it (verified: the
+  // handlers ignore untrusted input), so it is treated as a puzzle.
+  const SLIDER_PUZZLE_SELECTOR = ".captcha-slider-button, .captcha-wrapper .captcha-canvas";
   // A click starts the in-page proof-of-work; do not click the same control again
   // while it is still working (a second click would start a second computation).
   const CLICK_COOLDOWN_MS = 20000;
@@ -392,7 +400,8 @@
       .map((el) => el.textContent || "")
       .join(" ") : "";
     const body = (doc.body && doc.body.innerText) || "";
-    return `${title}\n${heading}\n${body}`.slice(0, 6000);
+    const shadow = deepShadowText(doc);
+    return `${title}\n${heading}\n${body}\n${shadow}`.slice(0, 6000);
   }
 
   function isVisible(el) {
@@ -413,16 +422,92 @@
     return !(style && (style.visibility === "hidden" || style.display === "none"));
   }
 
+  // The challenge's own control can be disabled: Brave ships its proof-of-work
+  // button disabled until the worker is ready, and its handler still accepts a
+  // programmatic click. Such a control counts as clickable while it is rendered
+  // and has real geometry — only the disabled gate is lifted, never the
+  // visibility rules that stop us clicking hidden or zero-size nodes.
+  function isDisabledChallengeControl(el) {
+    if (!el || !el.disabled) return false;
+    const style = el.ownerDocument?.defaultView?.getComputedStyle?.(el);
+    if (style && (style.visibility === "hidden" || style.display === "none" || Number(style.opacity) === 0)) return false;
+    const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+    return Boolean(rect && rect.width >= 2 && rect.height >= 2);
+  }
+
+  // Shadow-DOM-aware queries. A challenge widget (or its button) can live inside
+  // a web component; plain querySelectorAll stops at the shadow boundary, so the
+  // check is detected but no click target is ever found. Walk every open shadow
+  // root and collect matches across all of them. Bounded so a pathological page
+  // cannot turn one query into a freeze.
+  const MAX_DEEP_NODES = 20000;
+  const MAX_SHADOW_DEPTH = 8;
+  function* containers(root) {
+    const stack = [{ node: root, depth: 0 }];
+    let budget = MAX_DEEP_NODES;
+    while (stack.length && budget > 0) {
+      const { node, depth } = stack.pop();
+      budget -= 1;
+      yield node;
+      if (depth >= MAX_SHADOW_DEPTH || !node.querySelectorAll) continue;
+      let hosts;
+      try {
+        hosts = Array.from(node.querySelectorAll("*"));
+      } catch {
+        continue;
+      }
+      for (const host of hosts) {
+        budget -= 1;
+        if (budget <= 0) break;
+        if (host.shadowRoot) stack.push({ node: host.shadowRoot, depth: depth + 1 });
+      }
+    }
+  }
+  function deepQueryAll(root, selector) {
+    const found = [];
+    const seen = new Set();
+    for (const node of containers(root)) {
+      let matches;
+      try {
+        matches = node.querySelectorAll(selector);
+      } catch {
+        continue;
+      }
+      for (const el of matches) {
+        if (seen.has(el)) continue;
+        seen.add(el);
+        found.push(el);
+      }
+    }
+    return found;
+  }
+  function deepQuery(root, selector) {
+    return deepQueryAll(root, selector)[0] || null;
+  }
+  // Text rendered inside shadow roots never appears in body.innerText, so a
+  // challenge announced by a web component would otherwise look like a blank
+  // page. Append it (bounded) for detection.
+  function deepShadowText(doc, limit = 2000) {
+    let text = "";
+    for (const node of containers(doc)) {
+      const inner = cleanText(node.textContent || "");
+      if (!inner || node === doc || node.nodeType === 9) continue;
+      text += ` ${inner}`;
+      if (text.length >= limit) break;
+    }
+    return text.slice(0, limit);
+  }
+
   function findModalChallenge(doc) {
     let modals = [];
     try {
-      modals = Array.from(doc.querySelectorAll(MODAL_SELECTOR));
+      modals = deepQueryAll(doc, MODAL_SELECTOR);
     } catch {
       return null;
     }
     for (const modal of modals) {
       if (!isRendered(modal)) continue;
-      if (modal.querySelector && modal.querySelector(POW_BUTTON_SELECTOR)) return modal;
+      if (deepQuery(modal, POW_BUTTON_SELECTOR)) return modal;
       const text = cleanText(modal.innerText || modal.textContent);
       if (text.length <= 800 && MODAL_CHALLENGE_TEXT_RE.test(text)) return modal;
     }
@@ -435,8 +520,12 @@
     if (!scope || !scope.querySelector) return false;
     if (scope.matches && scope.matches("[data-state='verifying'], [data-state='solved']")) return true;
     if (scope.querySelector("[data-state='verifying'], [data-state='solved'], [aria-busy='true']")) return true;
-    const button = scope.querySelector(POW_BUTTON_SELECTOR);
-    if (button && (button.disabled || button.querySelector("[role='progressbar']"))) return true;
+    const button = deepQuery(scope, POW_BUTTON_SELECTOR);
+    if (button && button.querySelector("[role='progressbar']")) return true;
+    // A disabled control means "working" only after this page has been clicked:
+    // Brave ships the control disabled until its worker is ready, and reading
+    // that as already-solving would suppress the only click that starts it.
+    if (button && clickLog.has(button) && button.disabled) return true;
     return SOLVING_TEXT_RE.test(cleanText(scope.innerText || scope.textContent).slice(0, 600));
   }
 
@@ -471,8 +560,8 @@
     const text = pageText(doc);
     const linkCount = doc.querySelectorAll("a[href]").length;
     const thinPage = text.length < 2800 && linkCount < 16;
-    const puzzle = doc.querySelector(PUZZLE_SELECTOR);
-    const widget = doc.querySelector(WIDGET_SELECTOR);
+    const puzzle = deepQuery(doc, PUZZLE_SELECTOR) || deepQuery(doc, SLIDER_PUZZLE_SELECTOR);
+    const widget = deepQuery(doc, WIDGET_SELECTOR);
     const strongText = CHALLENGE_TEXT_RE.test(doc.title || "") || CHALLENGE_TEXT_RE.test(text);
     const urlHint = challengeUrlHint();
     const modal = findModalChallenge(doc);
@@ -482,8 +571,16 @@
     const scope = modal || doc.body || doc;
     const scopeText = modal ? cleanText(modal.innerText || modal.textContent) : text;
     const solving = Boolean(detected && !puzzle && isChallengeSolving(scope));
-    const autoSolving = Boolean(detected && !puzzle && (solving || AUTO_SOLVE_TEXT_RE.test(scopeText)));
-    const clickTarget = detected && !puzzle && !autoSolving ? findChallengeClickTarget(modal || doc) : null;
+    // A challenge control that is waiting to be pressed is an invitation, not a
+    // computation already under way: only fall back to the page text when no
+    // control exists, so a "verify" button is clicked instead of waited out.
+    let challengeControl = null;
+    let autoSolving = Boolean(detected && !puzzle && solving);
+    if (detected && !puzzle && !solving) {
+      challengeControl = findChallengeClickTarget(modal || doc);
+      if (!challengeControl) autoSolving = AUTO_SOLVE_TEXT_RE.test(scopeText);
+    }
+    const clickTarget = autoSolving ? null : challengeControl;
 
     let kind = "";
     if (puzzle) kind = "puzzle";
@@ -504,13 +601,12 @@
   }
 
   function findChallengeClickTarget(doc) {
-    const nodes = Array.from(doc.querySelectorAll(
+    const nodes = deepQueryAll(doc,
       "button, input[type=submit], input[type=button], input[type=checkbox], a[role=button], [role=button], [role=checkbox], label, .mark, .cb-lb"
-    ));
+    );
     let best = null;
     let bestScore = 0;
     for (const el of nodes) {
-      if (!isVisible(el)) continue;
       const label = elementLabel(el) || elementLabel(el.closest && el.closest("label,button,.cb-lb"));
       if (CLICK_SKIP_RE.test(label)) continue;
       let score = 0;
@@ -519,6 +615,11 @@
       if (/not a robot/i.test(label)) score += 4;
       if (el.matches && el.matches("input[type=checkbox], [role=checkbox]")) score += 2;
       if (el.tagName === "BUTTON" || (el.getAttribute && el.getAttribute("type") === "submit")) score += 1;
+      if (score < 6) continue;
+      // A disabled control is still the challenge's own button when its label
+      // says so: Brave ships "I'm not a robot" disabled until its proof-of-work
+      // worker is ready, and its handler accepts the programmatic click.
+      if (!isVisible(el) && !isDisabledChallengeControl(el)) continue;
       if (score > bestScore) {
         best = el;
         bestScore = score;
@@ -527,22 +628,54 @@
     return bestScore >= 6 ? best : null;
   }
 
-  function realClick(el) {
+  function realClick(el, options) {
     if (!el) return false;
     try {
       el.scrollIntoView?.({ block: "center", inline: "center" });
     } catch {
       /* ignore */
     }
-    const opts = { bubbles: true, cancelable: true, view: el.ownerDocument?.defaultView || undefined };
-    try { el.dispatchEvent(new MouseEvent("mousedown", opts)); } catch { /* ignore */ }
-    try { el.dispatchEvent(new MouseEvent("mouseup", opts)); } catch { /* ignore */ }
-    // Exactly one click. Dispatching a click event and then calling click() fires two
-    // before the page has disabled the button, which starts the proof-of-work twice.
+    const win = el.ownerDocument?.defaultView;
+    const PointerCtor = (win && win.PointerEvent) || MouseEvent;
+    const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+    const point = {
+      clientX: rect && rect.width ? rect.left + rect.width / 2 : 0,
+      clientY: rect && rect.height ? rect.top + rect.height / 2 : 0
+    };
+    // composed so the events cross a shadow boundary when the control lives
+    // inside a web component, and view so they carry the right window.
+    const opts = {
+      bubbles: true, cancelable: true, composed: true,
+      view: win || undefined, button: 0, buttons: 1,
+      clientX: point.clientX, clientY: point.clientY
+    };
+    // Brave ships its proof-of-work control disabled until the worker is ready;
+    // its handler still accepts a programmatic click, so lift the gate for the
+    // duration of this one click.
+    const wasDisabled = Boolean(options?.allowDisabled) && Boolean(el.disabled);
+    if (wasDisabled) {
+      try { el.disabled = false; } catch { /* ignore */ }
+    }
     try {
-      if (typeof el.click === "function") el.click();
-      else el.dispatchEvent(new MouseEvent("click", opts));
-    } catch { /* ignore */ }
+      try { el.focus?.({ preventScroll: true }); } catch { /* ignore */ }
+      try { el.dispatchEvent(new PointerCtor("pointerover", opts)); } catch { /* ignore */ }
+      try { el.dispatchEvent(new PointerCtor("pointerenter", opts)); } catch { /* ignore */ }
+      try { el.dispatchEvent(new MouseEvent("mouseover", opts)); } catch { /* ignore */ }
+      try { el.dispatchEvent(new PointerCtor("pointerdown", opts)); } catch { /* ignore */ }
+      try { el.dispatchEvent(new MouseEvent("mousedown", opts)); } catch { /* ignore */ }
+      try { el.dispatchEvent(new MouseEvent("mouseup", opts)); } catch { /* ignore */ }
+      try { el.dispatchEvent(new PointerCtor("pointerup", opts)); } catch { /* ignore */ }
+      // Exactly one click. Dispatching a click event and then calling click() fires two
+      // before the page has disabled the button, which starts the proof-of-work twice.
+      try {
+        if (typeof el.click === "function") el.click();
+        else el.dispatchEvent(new MouseEvent("click", opts));
+      } catch { /* ignore */ }
+    } finally {
+      if (wasDisabled) {
+        try { el.disabled = true; } catch { /* ignore */ }
+      }
+    }
     if (el.tagName === "INPUT" && el.type === "checkbox" && !el.checked) {
       try {
         el.checked = true;
@@ -563,21 +696,23 @@
       || (typeof document !== "undefined" ? document : null)
       || root;
     const scope = findModalChallenge(doc) || doc;
-    const target = findChallengeClickTarget(scope) || fallbackChallengeClickTarget(scope);
-    if (!target) return { ...info, clickable: false, clicked: false };
-    const lastClick = clickLog.get(target);
+    const target = findChallengeClickTarget(scope);
+    const fallback = target ? null : fallbackChallengeClickTarget(scope);
+    if (!target && !fallback) return { ...info, clickable: false, clicked: false };
+    const el = target || fallback;
+    const lastClick = clickLog.get(el);
     if (lastClick && Date.now() - lastClick < CLICK_COOLDOWN_MS) {
       return { ...info, clickable: true, clicked: false, autoSolving: true };
     }
-    clickLog.set(target, Date.now());
+    clickLog.set(el, Date.now());
     // A click starts the in-page work, so from here on the caller is waiting on it.
-    return { ...info, clickable: true, clicked: realClick(target), autoSolving: true };
+    return { ...info, clickable: true, clicked: realClick(el, { allowDisabled: Boolean(target) }), autoSolving: true };
   }
 
   function fallbackChallengeClickTarget(doc) {
-    const nodes = Array.from(doc.querySelectorAll(
+    const nodes = deepQueryAll(doc,
       "input[type=checkbox], [role=checkbox], button, input[type=submit], input[type=button], .mark, .cb-lb"
-    ));
+    );
     return nodes.find((el) => isVisible(el) && !CLICK_SKIP_RE.test(elementLabel(el))) || null;
   }
 
