@@ -128,6 +128,9 @@ export function inferXEntrySourceRole(entry, focalStatusId) {
   const entryId = String(entry?.entryId || "");
   if (entryId === `tweet-${focalStatusId}`) return "root_post";
   if (entryId.startsWith("conversationthread-")) return "reply_or_comment";
+  // Any other standalone `tweet-` entry sits above the focal post: the chain of posts
+  // it replies to, in order. (Promoted and related-post entries use other prefixes.)
+  if (entryId.startsWith("tweet-")) return "parent_context";
   return "";
 }
 export function collectXTweetResult(result, meta, output) {
@@ -178,7 +181,8 @@ export function normalizeXTweetResult(result, meta = {}) {
     || result.note_tweet_results?.result?.text
     || "";
   const rawText = noteText || legacy.full_text || "";
-  const text = expandXShortUrls(normalizePlainText(rawText), rawLinks);
+  const { text: visibleText, replyingTo } = splitReplyPrefix(stripMediaShortUrls(rawText, legacy), legacy, !noteText);
+  const text = expandXShortUrls(normalizePlainText(visibleText), rawLinks);
   const metrics = {
     replies: Number(legacy.reply_count || 0),
     reposts: Number(legacy.retweet_count || 0),
@@ -211,7 +215,48 @@ export function normalizeXTweetResult(result, meta = {}) {
     media: extractXTweetMedia(result, { contextId, statusId }),
     sourceRole: meta.sourceRole || "",
     quotedByStatusId: meta.quotedByStatusId || "",
+    // Who this post answers. Without these a thread is just a bag of posts and the
+    // model has to guess which reply is aimed at which.
+    replyToStatusId: String(legacy.in_reply_to_status_id_str || ""),
+    replyToHandle: String(legacy.in_reply_to_screen_name || "").replace(/^@/, ""),
+    replyingTo,
+    quotedStatusId: String(legacy.quoted_status_id_str || ""),
+    // Position in the TweetDetail response (page, entry, item), used to put the
+    // ancestor chain back in order.
+    entryOrder: Number(meta.pageIndex || 0) * 1000 + Number(meta.entryIndex || 0) + Number(meta.itemIndex || 0) / 100,
     sequenceIndex: meta.entryIndex ?? 0
+  };
+}
+/**
+ * X appends the t.co link of attached photos/videos to the post text. It carries no
+ * meaning, and a post that is only an image read as "just a link" to the model.
+ */
+export function stripMediaShortUrls(text, legacy) {
+  let output = String(text || "");
+  const media = [...(legacy?.entities?.media ?? []), ...(legacy?.extended_entities?.media ?? [])];
+  for (const item of media) {
+    if (item?.url) output = output.split(item.url).join("");
+  }
+  return output;
+}
+/**
+ * Replies start with the @handles of everyone in the chain; X hides them in the UI and
+ * records where the visible text begins (display_text_range, in Unicode code points).
+ * Move them out of the text and into `replyingTo`, so the text is what the author wrote.
+ * Only a prefix made purely of @mentions is ever removed.
+ */
+export function splitReplyPrefix(text, legacy, allowRange = true) {
+  const value = String(text || "");
+  const range = legacy?.display_text_range;
+  if (!allowRange || !legacy?.in_reply_to_status_id_str || !Array.isArray(range) || !(range[0] > 0)) {
+    return { text: value, replyingTo: [] };
+  }
+  const prefix = Array.from(value).slice(0, range[0]).join("");
+  if (!/^(?:\s*@\w{1,15})+\s*$/.test(prefix)) return { text: value, replyingTo: [] };
+  const handles = [...prefix.matchAll(/@(\w{1,15})/g)].map((match) => match[1]);
+  return {
+    text: value.slice(prefix.length),
+    replyingTo: uniqueBy(handles, (handle) => handle.toLowerCase())
   };
 }
 export function extractXTweetUser(result) {

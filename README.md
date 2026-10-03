@@ -66,7 +66,7 @@ Click **Test connection** to check the endpoint and model. A model that supports
 
 ### Privacy
 
-AskLocal talks to X in your logged-in browser session and to the model endpoint you configure. Nothing goes to any AskLocal server, because there isn't one. If you point it at a hosted API, your questions and the post context go to that provider. Web search opens your configured search engine in a brief background tab. Background profile scanning and web search are off by default.
+AskLocal talks to X in your logged-in browser session and to the model endpoint you configure. Nothing goes to any AskLocal server, because there isn't one. If you point it at a hosted API, your questions and the post context go to that provider. Web search opens your configured search engine in a brief background tab. If the engine shows a proof-of-work "I'm not a robot" check (Brave does), AskLocal clicks it in that background tab and waits for it to finish; image or slider captchas that need a person are not attempted. Background profile scanning and web search are off by default.
 
 ## Build from source
 
@@ -94,6 +94,8 @@ Answers stream into the panel as the model writes them (SSE); status updates abo
 
 AskLocal uses:
 
+- The thread as a reply tree: the chain from the thread root down to the selected post, the selected post marked, and its replies indented under the post each one answers (with "replying to @handle" on every reply), instead of a flat list of top replies. Replies are a sample, and the map at the top says how many are shown. If X's reply links can't be loaded and only the page is available, placement follows page order and is flagged as approximate
+- Media analyses printed directly under the post the image or video is on, so a post that is only a meme reads as that meme
 - Current post, including its timestamp, engagement counts (replies/reposts/likes/views), repost attribution, external links, and link-preview cards
 - A `textTruncated` flag on long posts cut off by "Show more", so the model knows to open the full post with `get`
 - Visible thread posts only when asking from that post's status page

@@ -5,22 +5,20 @@ import {
   normalizePlainText
 } from "../../lib/text.js";
 import {
-  uniqueBy
-} from "../../lib/utils.js";
-import {
   trimStitchedAnalysis
 } from "../media/video.js";
 import {
   capText
 } from "../prompt/budget.js";
 import {
+  buildConversation,
+  renderConversation
+} from "../prompt/thread.js";
+import {
   buildInspectableItems,
   lookupItemAlias,
   mediaAliasForTarget
 } from "./inspectables.js";
-import {
-  formatCompiledTweet
-} from "../x/parse.js";
 
 /**
  * Tool results go back to the model as compact text in the same shape as the
@@ -139,37 +137,37 @@ function renderGetSingle(result, context, maxChars) {
 function renderThread(thread, context, maxChars) {
   if (!thread) return "";
   // Assign short ids to the posts this read just added to the context.
-  buildInspectableItems(context);
+  const available = buildInspectableItems(context);
   const aliasOf = (tweet) => lookupItemAlias(context, "p", tweet?.contextId || (tweet?.statusId ? `post:${tweet.statusId}` : ""));
-  const keyOf = (tweet) => tweet?.statusId || tweet?.contextId || "";
-  const seen = new Set();
-  const lines = [`X post${thread.url ? ` ${thread.url}` : ""}:`];
-  const section = (label, tweets, chars, limit) => {
-    const fresh = (tweets ?? []).filter((tweet) => tweet && keyOf(tweet) && !seen.has(keyOf(tweet))).slice(0, limit);
-    if (!fresh.length) return;
-    lines.push(label);
-    for (const tweet of fresh) {
-      seen.add(keyOf(tweet));
-      lines.push(formatCompiledTweet(tweet, { aliasOf, maxChars: chars }));
-    }
-  };
+  const header = `X post${thread.url ? ` ${thread.url}` : ""}:`;
+  if (!thread.root) return `${header}\n${thread.error || "No readable posts were returned."}`;
 
-  const focal = thread.root;
-  if (thread.conversationRoot && keyOf(thread.conversationRoot) !== keyOf(focal)) {
-    section("Thread root:", [thread.conversationRoot], 1200, 1);
+  // Same reply tree as the prompt's own context, so a thread opened by a tool reads
+  // the same way: who answers whom is stated, not left to guess.
+  const mediaByPost = new Map();
+  for (const item of available.media ?? []) {
+    const list = mediaByPost.get(item.contextId) ?? [];
+    list.push(item);
+    mediaByPost.set(item.contextId, list);
   }
-  section("Earlier in the thread:", thread.parents, 500, 6);
-  section("Post:", [focal], Math.min(4000, Math.max(800, Math.floor(maxChars * 0.4))), 1);
-  section("Quoted post:", [thread.quoted], 1500, 1);
-  section(
-    "Replies (most liked first):",
-    uniqueBy([...(thread.topLikedReplies ?? []), ...(thread.rankedReplies ?? [])], keyOf),
-    400,
-    12
-  );
-  section("Other replies to the thread root:", thread.rootReplies, 300, 6);
-  if (lines.length === 1) lines.push(thread.error || "No readable posts were returned.");
-  return lines.join("\n");
+  const extras = (tweet) => (mediaByPost.get(tweet?.contextId || `post:${tweet?.statusId}`) ?? [])
+    .slice(0, 4)
+    .map((item) => `↳ ${item.mediaType} ${item.id}${item.altText ? ` (alt text: "${String(item.altText).replace(/\s+/g, " ").slice(0, 160)}")` : ""}`);
+  const conversation = buildConversation({ selected: thread.root, quoted: thread.quoted, thread });
+  const text = renderConversation(conversation, {
+    caps: {
+      parents: 6,
+      topLiked: 12,
+      ranked: 0,
+      rootReplies: 6,
+      visible: 0,
+      tweetChars: 400,
+      currentChars: Math.min(4000, Math.max(800, Math.floor(maxChars * 0.4)))
+    },
+    aliasOf,
+    extras
+  });
+  return `${header}\n${text || thread.error || "No readable posts were returned."}`;
 }
 
 function renderPage(result, context, maxChars) {

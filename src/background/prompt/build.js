@@ -23,14 +23,17 @@ import {
   mediaAliasForTarget
 } from "../tools/inspectables.js";
 import {
-  formatCompiledSubtitles,
-  formatCompiledTweet
+  formatCompiledSubtitles
 } from "../x/parse.js";
 import {
   capText,
   estimateTokens,
   resolveRequestBudget
 } from "./budget.js";
+import {
+  buildConversation,
+  renderConversation
+} from "./thread.js";
 
 export function buildSystemPrompt() {
   // Cache strategy (do not break this):
@@ -54,12 +57,15 @@ export function buildSystemPrompt() {
     "- If the user pushes back or adds information, re-check the evidence. Change your answer only when the evidence supports the change; otherwise explain briefly why it stands.",
     "",
     "Conversation:",
-    "- X context is a conversation: thread root, ancestors, the selected post, a quoted post, and replies. Attribute every claim to the right author, and don't treat replies as the selected post's claim.",
+    "- X context is a reply tree. Each post is indented under the post it replies to, \"replying to @x\" names who it answers, and ★ SELECTED marks the post the user clicked. Read the chain from the thread root down to the selected post first: a reply is usually a response to the post above it, not a standalone claim.",
+    "- Attribute every claim to the right author. A reply is not the selected post's claim, and the selected post's author does not own what replies to it say.",
+    "- Replies shown are a sample (most liked, or X's ranking). Don't say a reply is missing or that nobody responded just because it isn't listed; describe what the sample shows.",
     "- Context blocks and tool results from earlier messages in this chat still apply to follow-ups unless a newer context block replaces them.",
     "- Author profile history is background. Bring it up only when the user asks about the author or it clearly changes how to read the post.",
     "",
     "Media:",
-    "- Unless an image is attached, you cannot see or hear media. The media analyses in the context are your evidence for what images and videos show and say; describe only what they contain.",
+    "- Unless an image is attached, you cannot see or hear media. The media analyses printed directly under each post (\"↳ image m1, analysis: ...\") are your evidence for what that post's images and videos show and say; describe only what they contain.",
+    "- A post with no text, or only a link, is not missing context when its media analysis is shown: the image or video is the post. Treat the analysis as that post's content, attributed to its author. Call something missing only when it is truly absent from the context.",
     "- Summarize video as meaningful changes over time; give frame-by-frame detail only when asked.",
     "",
     "Tools (when offered):",
@@ -109,11 +115,19 @@ export function inferPromptPresetFromQuestion(question) {
   if (/^(summari[sz]e|summerize)( this)?( post| tweet| thread| video| image| link| page)?$/.test(text)) return "summarize";
   return "";
 }
+/**
+ * Trim levels, tried in order until the prompt fits. For the thread tree:
+ *   parents      posts kept on the chain above the selected post (thread root + the nearest ones)
+ *   topLiked+ranked  replies kept under the selected post
+ *   rootReplies  posts kept from elsewhere in the thread (siblings, replies to the root)
+ *   visible      page-scraped posts that could not be placed in the tree
+ * The chain above the selected post is what it answers, so it is trimmed last.
+ */
 export const CONTEXT_TRIM_LEVELS = [
-  { topLiked: 8, ranked: 3, visible: 12, parents: 6, rootReplies: 8, tweetChars: 600, currentChars: 1500, subtitleChars: 1200, webReadChars: 5000, analysisChars: 6000, profiles: 4, profilePosts: 5, evidenceChars: Infinity },
-  { topLiked: 5, ranked: 0, visible: 6, parents: 4, rootReplies: 4, tweetChars: 400, currentChars: 1200, subtitleChars: 600, webReadChars: 2500, analysisChars: 3500, profiles: 2, profilePosts: 3, evidenceChars: 6000 },
-  { topLiked: 3, ranked: 0, visible: 3, parents: 2, rootReplies: 2, tweetChars: 280, currentChars: 900, subtitleChars: 300, webReadChars: 1200, analysisChars: 1800, profiles: 1, profilePosts: 2, evidenceChars: 3000 },
-  { topLiked: 2, ranked: 0, visible: 0, parents: 1, rootReplies: 0, tweetChars: 200, currentChars: 600, subtitleChars: 0, webReadChars: 600, analysisChars: 900, profiles: 0, profilePosts: 0, evidenceChars: 1200 }
+  { topLiked: 8, ranked: 3, visible: 6, parents: 8, rootReplies: 8, tweetChars: 600, currentChars: 1500, subtitleChars: 1200, webReadChars: 5000, analysisChars: 6000, profiles: 4, profilePosts: 5, evidenceChars: Infinity },
+  { topLiked: 5, ranked: 0, visible: 3, parents: 5, rootReplies: 4, tweetChars: 400, currentChars: 1200, subtitleChars: 600, webReadChars: 2500, analysisChars: 3500, profiles: 2, profilePosts: 3, evidenceChars: 6000 },
+  { topLiked: 3, ranked: 0, visible: 2, parents: 3, rootReplies: 2, tweetChars: 280, currentChars: 900, subtitleChars: 300, webReadChars: 1200, analysisChars: 1800, profiles: 1, profilePosts: 2, evidenceChars: 3000 },
+  { topLiked: 2, ranked: 0, visible: 0, parents: 2, rootReplies: 0, tweetChars: 200, currentChars: 600, subtitleChars: 0, webReadChars: 600, analysisChars: 900, profiles: 0, profilePosts: 0, evidenceChars: 1200 }
 ];
 /**
  * Build this turn's user message.
@@ -139,15 +153,18 @@ export function buildPromptAtLevel(question, context, caps = {}, settings = {}, 
   const sections = [];
 
   if (includeFullContext) {
-    const posts = compileContextPosts(context, caps);
+    // Media analyses are printed under the post they belong to, so the model reads a
+    // post and what its image shows as one thing. Whatever could not be placed there
+    // (media on posts trimmed away, tool-driven reads) goes in its own section.
+    const media = createMediaNotes(context, caps);
+    const posts = compileContextPosts(context, caps, media);
     if (posts) sections.push(`X post context:\n${posts}`);
-    const failedMediaAliases = new Set();
     sections.push(
-      buildMediaLinkLegend(context),
-      renderMediaAnalysesSection(context, caps, failedMediaAliases),
+      buildMediaLinkLegend(context, media.shown),
+      renderMediaAnalysesSection(context, caps, media),
       renderLinkedPagesSection(context, caps),
       renderAuthorProfilesSection(context, caps),
-      renderContextNotes(context, failedMediaAliases)
+      renderContextNotes(context, media.failed)
     );
   }
 
@@ -166,11 +183,12 @@ export function buildPromptAtLevel(question, context, caps = {}, settings = {}, 
   sections.push(`User message:\n${promptQuestion}`);
   return sections.filter(Boolean).join("\n\n");
 }
-export function compileContextPosts(context, caps = {}) {
+/**
+ * The posts around the selected one, as a reply tree (see prompt/thread.js). `media`
+ * (from createMediaNotes) puts each post's media analyses directly under it.
+ */
+export function compileContextPosts(context, caps = {}, media = null) {
   const x = context.xPostContext?.ok ? context.xPostContext : null;
-  const seen = new Set();
-  const lines = [];
-  const keyOf = (tweet) => tweet?.statusId || tweet?.contextId || "";
 
   // Seed the session's short aliases (p1, m2, …) so the ids printed here are the
   // same ones get/search results will use for the rest of the session.
@@ -180,102 +198,90 @@ export function compileContextPosts(context, caps = {}) {
     return lookupItemAlias(context, "p", key);
   };
 
-  const pushSection = (heading, tweets, options = {}) => {
-    const fresh = (tweets ?? []).filter((tweet) => tweet && !seen.has(keyOf(tweet)));
-    if (!fresh.length) return;
-    lines.push(heading);
-    fresh.forEach((tweet, index) => {
-      if (keyOf(tweet)) seen.add(keyOf(tweet));
-      lines.push(`${options.numbered ? `${index + 1}. ` : ""}${formatCompiledTweet(tweet, { ...options, aliasOf })}`);
-      if (options.subtitles && caps.subtitleChars > 0) {
-        const subtitles = formatCompiledSubtitles(tweet, caps.subtitleChars);
-        if (subtitles) lines.push(subtitles);
-      }
-    });
-  };
-
-  // When the user clicked a comment (focal post differs from the conversation root),
-  // present the whole thread as a timeline: root → ancestry → selected → replies.
-  const isComment = Boolean(x && x.rootStatusId && x.focalStatusId && x.rootStatusId !== x.focalStatusId);
-  const conversationRoot = isComment
-    ? x.conversationRoot ?? (x.parents ?? []).find((tweet) => tweet.statusId === x.rootStatusId) ?? null
-    : null;
-  const selected = context.currentTweet || x?.root;
-  const quoted = context.quotedTweet || x?.quoted;
-
-  if (isComment) {
-    pushSection("Thread root (the original post):", [conversationRoot], {
-      subtitles: true,
-      maxChars: caps.currentChars ?? 2000
-    });
-    pushSection("Quoted post:", [quoted], { subtitles: true, maxChars: caps.currentChars ?? 2000 });
-    pushSection(
-      "Earlier in the thread (root → selected, in order):",
-      (x?.parents ?? []).slice(0, caps.parents ?? 8),
-      { numbered: true, maxChars: caps.tweetChars }
-    );
-    pushSection("Selected post (the reply the user clicked):", [selected], {
-      subtitles: true,
-      maxChars: caps.currentChars ?? 2000
-    });
-    pushSection(
-      "Replies to the selected post (most liked first):",
-      (x?.topLikedReplies ?? []).slice(0, caps.topLiked ?? 12),
-      { numbered: true, maxChars: caps.tweetChars }
-    );
-    pushSection(
-      "More replies to the selected post (X's ranking):",
-      (x?.rankedReplies ?? []).slice(0, caps.ranked ?? 6),
-      { numbered: true, maxChars: caps.tweetChars }
-    );
-    pushSection(
-      "Other replies to the thread root (most liked first):",
-      (x?.rootReplies ?? []).slice(0, caps.rootReplies ?? 12),
-      { numbered: true, maxChars: caps.tweetChars }
-    );
-  } else {
-    pushSection("Selected post:", [selected], {
-      subtitles: true,
-      maxChars: caps.currentChars ?? 2000
-    });
-    pushSection("Quoted post:", [quoted], { subtitles: true, maxChars: caps.currentChars ?? 2000 });
-    pushSection(
-      "Earlier in the thread:",
-      (x?.parents ?? []).slice(0, caps.parents ?? 8),
-      { numbered: true, maxChars: caps.tweetChars }
-    );
-    pushSection(
-      "Replies (most liked first):",
-      (x?.topLikedReplies ?? []).slice(0, caps.topLiked ?? 12),
-      { numbered: true, maxChars: caps.tweetChars }
-    );
-    pushSection(
-      "More replies (X's ranking):",
-      (x?.rankedReplies ?? []).slice(0, caps.ranked ?? 6),
-      { numbered: true, maxChars: caps.tweetChars }
-    );
-  }
-
-  // visibleThread already contains the merged API posts (mergeXPostContextIntoAskContext),
-  // so after the sections above only genuinely new DOM-scraped posts remain.
-  const otherVisible = (context.visibleThread ?? [])
-    .filter((tweet) => tweet && !seen.has(keyOf(tweet)))
-    .slice(0, caps.visible ?? 24);
-  pushSection("Other posts visible on the page:", otherVisible, { numbered: true, maxChars: caps.tweetChars });
-
-  return lines.join("\n");
+  const conversation = buildConversation({
+    selected: context.currentTweet || x?.root || null,
+    quoted: context.quotedTweet || x?.quoted || null,
+    thread: x,
+    extraPosts: context.visibleThread ?? []
+  });
+  return renderConversation(conversation, { caps, aliasOf, extras: media?.extrasFor ?? null });
 }
 
 /**
- * Media and link ids for tool calls. Post ids already sit next to each post's
- * @handle, so only media (which the post lines describe without ids) and links
- * need a legend. Links scraped from inside opened pages are left out: they are
- * rarely what the user means and used to crowd out the post's own links.
+ * Per-post media lines for the thread tree: "↳ image m1, analysis: ..." under the post
+ * the image is on. Tracks which media were shown, which analyses were placed, and which
+ * failed, so the leftovers can be listed separately and nothing is printed twice.
  */
-export function buildMediaLinkLegend(context) {
+export function createMediaNotes(context, caps = {}) {
+  const available = buildInspectableItems(context);
+  const mediaByPost = new Map();
+  for (const item of available.media ?? []) {
+    const list = mediaByPost.get(item.contextId) ?? [];
+    list.push(item);
+    mediaByPost.set(item.contextId, list);
+  }
+
+  // One analysis per media item; a successful read beats a failed one.
+  const analysisByAlias = new Map();
+  for (const read of context.mediaAnalyses ?? []) {
+    const alias = mediaAliasForTarget(context, read?.target);
+    if (!alias) continue;
+    const existing = analysisByAlias.get(alias);
+    if (!existing || (!existing.ok && read.ok)) analysisByAlias.set(alias, read);
+  }
+
+  const shown = new Set();
+  const placed = new Set();
+  const failed = new Set();
+  const cap = clampNumber(caps.analysisChars, 400, 24000, 4000);
+
+  const describe = (item, primary) => {
+    const alt = item.altText ? ` (alt text: "${oneLine(item.altText, 160)}")` : "";
+    const head = `↳ ${item.mediaType} ${item.id}${alt}`;
+    const read = analysisByAlias.get(item.id);
+    shown.add(item.id);
+    if (!read) return `${head}: not analyzed`;
+    placed.add(item.id);
+    if (!read.ok) {
+      failed.add(item.id);
+      return `${head}: could not be analyzed (${oneLine(read.error || "unknown error", 200)})`;
+    }
+    // Media on the posts that matter most gets the full analysis; the rest a short one.
+    const analysisCap = primary ? cap : Math.min(cap, 900);
+    const lines = [
+      `${head}, analysis:`,
+      `  ${trimStitchedAnalysis(String(read.analysis || "").trim(), analysisCap).replace(/\n/g, "\n  ") || "[no visual analysis returned]"}`
+    ];
+    const audio = trimStitchedAnalysis(String(read.audioAnalysis || "").trim(), Math.max(600, Math.floor(analysisCap * 0.45)));
+    if (audio) lines.push(`  Audio: ${audio.replace(/\n/g, "\n  ")}`);
+    else if (read.audioError && !read.audioMergedIntoAnalysis) lines.push(`  Audio could not be analyzed: ${oneLine(read.audioError, 200)}`);
+    return lines.join("\n");
+  };
+
+  const extrasFor = (tweet, { primary = false } = {}) => {
+    const contextId = tweet?.contextId || (tweet?.statusId ? `post:${tweet.statusId}` : "");
+    const blocks = (mediaByPost.get(contextId) ?? []).slice(0, 4).map((item) => describe(item, primary));
+    if (primary && caps.subtitleChars > 0) {
+      const subtitles = formatCompiledSubtitles(tweet, caps.subtitleChars);
+      if (subtitles) blocks.push(subtitles);
+    }
+    return blocks;
+  };
+
+  return { extrasFor, analysisByAlias, shown, placed, failed };
+}
+
+/**
+ * Ids for tool calls. Post and media ids already sit next to the posts they belong to,
+ * so the legend covers links, plus any media whose post was left out of the thread.
+ * Links scraped from inside opened pages are left out: they are rarely what the user
+ * means and used to crowd out the post's own links.
+ */
+export function buildMediaLinkLegend(context, shownMedia = new Set()) {
   const available = buildInspectableItems(context);
   const lines = [];
-  for (const item of (available.media ?? []).slice(0, 12)) {
+  const unshown = (available.media ?? []).filter((item) => !shownMedia.has(item.id));
+  for (const item of unshown.slice(0, 12)) {
     const formatted = formatLookupItem(item, item.id);
     if (!formatted?.id || !formatted?.citeAs) continue;
     lines.push(`- ${formatted.id}: ${formatted.citeAs}${formatted.roleLabel ? ` (on the ${formatted.roleLabel})` : ""}`);
@@ -302,18 +308,21 @@ function describeMediaRead(read) {
   return handle ? `${type} from @${handle}` : type;
 }
 
-function renderMediaAnalysesSection(context, caps, failedAliases) {
+/** Analyses that were not printed under a post in the thread tree. */
+function renderMediaAnalysesSection(context, caps, media) {
   const cap = clampNumber(caps.analysisChars, 400, 24000, 4000);
   const reads = uniqueBy(
     (context.mediaAnalyses ?? []).map((read, index) => ({ read, alias: mediaAliasForTarget(context, read?.target), index })),
     (entry) => entry.alias ? `${entry.alias}:${entry.read?.ok ? 1 : 0}` : `#${entry.index}`
-  ).slice(0, 6);
+  )
+    .filter(({ alias }) => !(alias && media.placed.has(alias)))
+    .slice(0, 6);
   if (!reads.length) return "";
 
   const blocks = reads.map(({ read, alias }) => {
     const head = `${alias ? `${alias}, ` : ""}${describeMediaRead(read)}`;
     if (!read.ok) {
-      if (alias) failedAliases.add(alias);
+      if (alias) media.failed.add(alias);
       return `${head}: could not be analyzed (${oneLine(read.error || "unknown error", 200)})`;
     }
     const lines = [`${head}:`, trimStitchedAnalysis(String(read.analysis || "").trim(), cap) || "[no visual analysis returned]"];
@@ -322,7 +331,7 @@ function renderMediaAnalysesSection(context, caps, failedAliases) {
     else if (read.audioError && !read.audioMergedIntoAnalysis) lines.push(`Audio could not be analyzed: ${oneLine(read.audioError, 200)}`);
     return lines.join("\n");
   });
-  return `Media analyses (your evidence for what the media shows and says):\n${blocks.join("\n\n")}`;
+  return `Other media analyses (media that is not on a post shown above; your evidence for what it shows and says):\n${blocks.join("\n\n")}`;
 }
 
 function renderLinkedPagesSection(context, caps) {

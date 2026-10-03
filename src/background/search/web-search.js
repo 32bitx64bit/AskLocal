@@ -1,6 +1,8 @@
 import { api } from "../api.js";
 import {
   SEARCH_CHALLENGE_WAIT_MS,
+  SEARCH_EMPTY_RECHECKS,
+  SEARCH_EMPTY_RECHECK_MS,
   SEARCH_TAB_TIMEOUT_MS
 } from "../constants.js";
 import {
@@ -228,9 +230,18 @@ export async function runSerpTabSearch(engine, query, maxResults, signal, progre
 
     let challenge = await tryPassSearchChallengeOnTab(tabId);
     if (!challenge.detected) {
-      const results = await runSerpExtractorOnTab(tabId, engine, url, maxResults);
+      let results = await safeRunSerpExtractorOnTab(tabId, engine, url, maxResults);
       if (results.length) return results;
-      challenge = await tryPassSearchChallengeOnTab(tabId);
+      // Some engines only show the check after the page hydrates, so an empty page
+      // is not yet proof that there is nothing to pass. Look again briefly.
+      for (let attempt = 0; attempt < SEARCH_EMPTY_RECHECKS && !challenge.detected; attempt += 1) {
+        await sleep(SEARCH_EMPTY_RECHECK_MS);
+        throwIfAborted(signal);
+        challenge = await tryPassSearchChallengeOnTab(tabId);
+        if (challenge.detected) break;
+        results = await safeRunSerpExtractorOnTab(tabId, engine, url, maxResults);
+        if (results.length) return results;
+      }
     }
     if (challenge.requiresHuman) {
       throw new Error(challengeFailureMessage(engine, challenge));
@@ -248,21 +259,38 @@ export async function runSerpTabSearch(engine, query, maxResults, signal, progre
   }
 }
 
+/** Extraction while the tab may be navigating (a solved check redirects): failure means "no results yet". */
+async function safeRunSerpExtractorOnTab(tabId, engine, url, maxResults) {
+  try {
+    return await runSerpExtractorOnTab(tabId, engine, url, maxResults);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Keep the check going until the engine lets us through. Each pass lets the page
+ * click its verify control (once; the extractor guards against double clicks), then
+ * reads results only when the check is gone or has stopped blocking them. Waiting
+ * for it to clear matters: closing the tab mid-computation throws the work away and
+ * the next search gets the same check again.
+ */
 async function waitForChallengeSearchResults(tabId, engine, url, maxResults, signal) {
   const deadline = Date.now() + SEARCH_CHALLENGE_WAIT_MS;
   let last = [];
   while (Date.now() < deadline) {
     throwIfAborted(signal);
-    const remaining = Math.max(250, deadline - Date.now());
-    await waitForSearchTab(tabId, remaining, signal);
-    last = await runSerpExtractorOnTab(tabId, engine, url, maxResults);
-    if (last.length) return last;
-    const inspect = await inspectSearchChallengeOnTab(tabId);
-    if (inspect.requiresHuman) throw new Error(challengeFailureMessage(engine, inspect));
-    if (inspect.clickable || inspect.detected) await tryPassSearchChallengeOnTab(tabId);
-    await sleep(Math.min(400, Math.max(0, deadline - Date.now())));
+    await waitForSearchTab(tabId, Math.max(250, deadline - Date.now()), signal);
+    const status = await tryPassSearchChallengeOnTab(tabId);
+    if (status.requiresHuman) throw new Error(challengeFailureMessage(engine, status));
+    const working = status.detected && status.autoSolving;
+    if (!working) {
+      last = await safeRunSerpExtractorOnTab(tabId, engine, url, maxResults);
+      if (last.length) return last;
+    }
+    await sleep(Math.min(working ? 600 : 400, Math.max(0, deadline - Date.now())));
   }
-  return last.length ? last : runSerpExtractorOnTab(tabId, engine, url, maxResults);
+  return safeRunSerpExtractorOnTab(tabId, engine, url, maxResults);
 }
 export async function fetchEngineFallbackResults(key, query, maxResults) {
   // Server-rendered HTML fallback, used only when the render tier (scripting)

@@ -98,7 +98,7 @@ export const PROMPT_PRESETS = {
     task: [
       "- Explain what the selected post (and its media) is saying and why it matters in the thread.",
       "- Lead with the plain-language point, then add only the background needed to follow the argument.",
-      "- Track who is responding to whom when replies matter.",
+      "- Start from what the selected post is replying to (the post above it in the reply chain) and track who is responding to whom.",
       "- Mention tone, assumptions, or missing context only when they change the meaning.",
       "- Use tools when text is truncated or a link, media, or current fact is needed to explain accurately.",
       "- Don't turn the explanation into a fact-check unless the claim needs verifying."
@@ -141,6 +141,13 @@ export const PROMPT_PRESETS = {
 };
 export const DONT_RETRY_HINT = "Do not retry the same id or arguments. Copy an exact id from didYouMean or the available listings, or answer from the context you already have.";
 export const SEARCH_TAB_TIMEOUT_MS = 18000;
-/** After clicking a bot-check, wait this long for SERP results before failing the engine. */
-export const SEARCH_CHALLENGE_WAIT_MS = 5000;
+/**
+ * After clicking a bot-check, wait this long for SERP results before failing the engine.
+ * Proof-of-work checks (Brave) hash in the page and can take tens of seconds on a slow
+ * machine; a background tab is not throttled for that work, so be patient.
+ */
+export const SEARCH_CHALLENGE_WAIT_MS = 45000;
+/** Re-checks for a late-appearing bot-check when a results page comes back empty. */
+export const SEARCH_EMPTY_RECHECKS = 4;
+export const SEARCH_EMPTY_RECHECK_MS = 500;
 

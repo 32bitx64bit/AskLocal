@@ -62,12 +62,12 @@ export async function collectXPostContextInBackground(target, options = {}, cont
   return result;
 }
 
-async function collectXPostContextUncached(target, statusId, { maxReplies, maxRankedReplies, maxPages }, context) {
+async function collectXPostContextUncached(target, statusId, limits, context) {
   const pages = [];
   const cursors = new Set();
   let cursor = "";
 
-  for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+  for (let pageIndex = 0; pageIndex < limits.maxPages; pageIndex += 1) {
     throwIfAborted(context.abortSignal);
     const page = await requestXGraphQL(context, "TweetDetail", buildTweetDetailVariables(statusId, cursor));
     pages.push(page);
@@ -78,6 +78,38 @@ async function collectXPostContextUncached(target, statusId, { maxReplies, maxRa
     cursor = nextCursor;
   }
 
+  // When the selected post is a comment, the TweetDetail above is focused on that
+  // comment: it returns the ancestor chain and replies *to the comment*, but not the
+  // original post's own comment section. Fetch one page focused on the conversation
+  // root so the model sees the whole thread it is reasoning about.
+  const rootStatusId = findRootStatusId(pages, statusId);
+  let rootPage = null;
+  if (rootStatusId && rootStatusId !== statusId) {
+    try {
+      rootPage = await requestXGraphQL(context, "TweetDetail", buildTweetDetailVariables(rootStatusId));
+    } catch {
+      // Root-thread expansion is best-effort; the comment-focused context still stands.
+    }
+  }
+  return assembleXPostContext({ pages, rootPage, target, statusId, limits });
+}
+/** Conversation root of the focal post, or "" when the page does not contain it. */
+export function findRootStatusId(pages, statusId) {
+  for (const [pageIndex, page] of (pages ?? []).entries()) {
+    const selected = collectTweetsFromTweetDetail(page, { focalStatusId: statusId, pageIndex })
+      .find((tweet) => tweet.statusId === statusId);
+    if (selected) return selected.conversationId || statusId;
+  }
+  return "";
+}
+/**
+ * Turn raw TweetDetail pages (and optionally the page focused on the thread root) into
+ * the thread the prompt is built from. Pure: no network, so it can be tested on fixtures.
+ */
+export function assembleXPostContext({ pages, rootPage = null, target = null, statusId, limits = {} }) {
+  const maxReplies = limits.maxReplies ?? 16;
+  const maxRankedReplies = limits.maxRankedReplies ?? 8;
+
   const tweets = uniqueBy(
     pages.flatMap((page, pageIndex) => collectTweetsFromTweetDetail(page, {
       focalStatusId: statusId,
@@ -86,7 +118,8 @@ async function collectXPostContextUncached(target, statusId, { maxReplies, maxRa
     (tweet) => tweet.statusId || tweet.contextId
   );
 
-  const selected = tweets.find((tweet) => tweet.statusId === statusId) ?? null;
+  const byId = new Map(tweets.filter((tweet) => tweet.statusId).map((tweet) => [tweet.statusId, tweet]));
+  const selected = byId.get(statusId) ?? null;
   const rootStatusId = selected?.conversationId || statusId;
   const root = selected
     ? {
@@ -100,51 +133,52 @@ async function collectXPostContextUncached(target, statusId, { maxReplies, maxRa
     ?? tweets.find((tweet) => tweet.sourceRole === "quoted_post")
     ?? null;
 
-  const parents = tweets
-    .filter((tweet) => tweet.statusId && tweet.statusId !== statusId && tweet.statusId !== quoted?.statusId)
-    .filter((tweet) => tweet.statusId === rootStatusId || tweet.sourceRole === "parent_context")
-    .map((tweet, index) => ({
-      ...tweet,
-      threadRole: tweet.statusId === rootStatusId ? "conversation_root" : "parent_context",
-      visibleRole: tweet.statusId === rootStatusId ? "conversation_root" : "parent_context",
-      sequenceIndex: index
-    }));
+  // Ancestors: follow reply-to links up from the selected post, then add any standalone
+  // entries X placed above it (covers a link whose target we do not have the id for).
+  const ancestors = collectAncestors(selected, tweets, byId, quoted);
+  const ancestorIds = new Set(ancestors.map((tweet) => tweet.statusId));
+  const parents = ancestors.map((tweet, index) => ({
+    ...tweet,
+    threadRole: tweet.statusId === rootStatusId ? "conversation_root" : "parent_context",
+    visibleRole: tweet.statusId === rootStatusId ? "conversation_root" : "parent_context",
+    sequenceIndex: index
+  }));
 
   const replyCandidates = tweets
     .filter((tweet) => tweet.statusId && tweet.statusId !== statusId && tweet.statusId !== rootStatusId && tweet.statusId !== quoted?.statusId)
+    .filter((tweet) => !ancestorIds.has(tweet.statusId) && tweet.sourceRole !== "quoted_post")
     .filter((tweet) => tweet.conversationId === rootStatusId || tweet.sourceRole === "reply_or_comment")
     .filter((tweet) => tweet.text || tweet.media?.length);
+  // Replies are picked by X's ranking / popularity, so a picked reply often answers one
+  // that was not picked. Pull those in too or the thread falls apart into orphans.
+  const connectBoundary = new Set([statusId, rootStatusId, ...ancestorIds]);
 
-  const rankedReplies = uniqueBy(replyCandidates, (tweet) => tweet.statusId)
-    .slice(0, maxRankedReplies)
-    .map((tweet, index) => ({
-      ...tweet,
-      threadRole: "x_ranked_reply",
-      visibleRole: "x_ranked_reply",
-      sequenceIndex: index
-    }));
+  const rankedReplies = withConnectingReplies(
+    uniqueBy(replyCandidates, (tweet) => tweet.statusId).slice(0, maxRankedReplies),
+    byId,
+    connectBoundary
+  ).map((tweet, index) => ({
+    ...tweet,
+    threadRole: "x_ranked_reply",
+    visibleRole: "x_ranked_reply",
+    sequenceIndex: index
+  }));
 
-  const topLikedReplies = uniqueBy(
-    [...replyCandidates].sort(compareTweetsByContextValue),
-    (tweet) => tweet.statusId
-  )
-    .slice(0, maxReplies)
-    .map((tweet, index) => ({
-      ...tweet,
-      threadRole: "top_liked_reply",
-      visibleRole: "top_liked_reply",
-      sequenceIndex: index
-    }));
+  const topLikedReplies = withConnectingReplies(
+    uniqueBy([...replyCandidates].sort(compareTweetsByContextValue), (tweet) => tweet.statusId).slice(0, maxReplies),
+    byId,
+    connectBoundary
+  ).map((tweet, index) => ({
+    ...tweet,
+    threadRole: "top_liked_reply",
+    visibleRole: "top_liked_reply",
+    sequenceIndex: index
+  }));
 
-  // When the selected post is a comment, the TweetDetail above is focused on that
-  // comment: it returns the ancestor chain and replies *to the comment*, but not the
-  // original post's own comment section. Fetch one page focused on the conversation
-  // root so the model sees the whole thread it is reasoning about.
   let conversationRoot = null;
   let rootReplies = [];
-  if (root && rootStatusId && rootStatusId !== statusId) {
+  if (root && rootPage && rootStatusId && rootStatusId !== statusId) {
     try {
-      const rootPage = await requestXGraphQL(context, "TweetDetail", buildTweetDetailVariables(rootStatusId));
       const rootTweets = uniqueBy(collectTweetsFromTweetDetail(rootPage, {
         focalStatusId: rootStatusId,
         pageIndex: 0
@@ -157,7 +191,8 @@ async function collectXPostContextUncached(target, statusId, { maxReplies, maxRa
         ? { ...foundRoot, threadRole: "conversation_root", visibleRole: "conversation_root" }
         : null;
 
-      rootReplies = uniqueBy(
+      const rootById = new Map(rootTweets.filter((tweet) => tweet.statusId).map((tweet) => [tweet.statusId, tweet]));
+      const pickedRootReplies = uniqueBy(
         rootTweets
           .filter((tweet) => tweet.statusId && tweet.statusId !== rootStatusId && !knownIds.has(tweet.statusId))
           .filter((tweet) => tweet.sourceRole !== "quoted_post")
@@ -165,8 +200,8 @@ async function collectXPostContextUncached(target, statusId, { maxReplies, maxRa
           .filter((tweet) => tweet.text || tweet.media?.length)
           .sort(compareTweetsByContextValue),
         (tweet) => tweet.statusId
-      )
-        .slice(0, maxReplies)
+      ).slice(0, maxReplies);
+      rootReplies = withConnectingReplies(pickedRootReplies, rootById, new Set([rootStatusId, ...knownIds]))
         .map((tweet, index) => ({
           ...tweet,
           threadRole: "thread_comment",
@@ -178,10 +213,12 @@ async function collectXPostContextUncached(target, statusId, { maxReplies, maxRa
     }
   }
 
+  // Reading order (thread root first, then down the chain to the selected post and its
+  // replies): the short ids handed out later (p1, p2, ...) then follow the thread.
   const posts = uniqueBy([
-    root,
     conversationRoot,
     ...parents,
+    root,
     quoted ? { ...quoted, threadRole: "quoted_post", visibleRole: "quoted_post" } : null,
     ...topLikedReplies,
     ...rankedReplies,
@@ -196,7 +233,7 @@ async function collectXPostContextUncached(target, statusId, { maxReplies, maxRa
     url: root?.url || target?.url || (statusId ? `https://x.com/i/web/status/${statusId}` : ""),
     collectedAt: new Date().toISOString(),
     sampledPostCount: tweets.length + rootReplies.length,
-    pageCount: pages.length,
+    pageCount: (pages ?? []).length,
     root,
     conversationRoot,
     parents,
@@ -208,6 +245,37 @@ async function collectXPostContextUncached(target, statusId, { maxReplies, maxRa
     error: root ? "" : "X returned timeline data, but the selected post was not found."
   };
   return result;
+}
+/** Posts above `selected`, root first: reply-to links where we have the post, entry order otherwise. */
+function collectAncestors(selected, tweets, byId, quoted) {
+  if (!selected) return [];
+  const found = new Map();
+  let cursor = selected;
+  for (let depth = 0; cursor?.replyToStatusId && depth < 40; depth += 1) {
+    const parent = byId.get(cursor.replyToStatusId);
+    if (!parent || found.has(parent.statusId) || parent.statusId === selected.statusId) break;
+    found.set(parent.statusId, parent);
+    cursor = parent;
+  }
+  for (const tweet of tweets) {
+    if (tweet.sourceRole !== "parent_context" || !tweet.statusId) continue;
+    if (tweet.statusId === selected.statusId || tweet.statusId === quoted?.statusId) continue;
+    if (!found.has(tweet.statusId)) found.set(tweet.statusId, tweet);
+  }
+  return [...found.values()].sort((left, right) => Number(left.entryOrder ?? 0) - Number(right.entryOrder ?? 0));
+}
+/** `picked` plus the in-between replies that connect each one to the post it answers. */
+function withConnectingReplies(picked, byId, boundaryIds) {
+  const out = new Map(picked.filter((tweet) => tweet?.statusId).map((tweet) => [tweet.statusId, tweet]));
+  for (const tweet of picked) {
+    let parent = byId.get(tweet?.replyToStatusId);
+    for (let guard = 0; parent && guard < 20; guard += 1) {
+      if (boundaryIds.has(parent.statusId) || out.has(parent.statusId)) break;
+      if (parent.sourceRole !== "quoted_post" && (parent.text || parent.media?.length)) out.set(parent.statusId, parent);
+      parent = byId.get(parent.replyToStatusId);
+    }
+  }
+  return [...out.values()];
 }
 export async function collectProfileInBackground(handle, maxPosts) {
   const cleanHandle = String(handle || "").replace(/^@/, "");

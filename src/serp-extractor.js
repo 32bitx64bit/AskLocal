@@ -354,7 +354,11 @@
     return results.slice(0, maxResults);
   }
 
-  const CHALLENGE_TEXT_RE = /i.?m not a robot|verify (?:you are|you.?re)(?: a)? human|confirm you.?re (?:a )?human|prove you(?: are|.?re)(?: a)? human|checking your browser|just a moment|attention required|unusual traffic|enable javascript(?: and cookies)?|making sure you.?re not a bot|please (?:verify|complete)(?: the)?(?: security)?(?: check)?|bot (?:check|detection)|are you (?:a )?human|human verification|solve (?:the )?(?:pow )?challenge|confirm you.?re a human being/i;
+  const CHALLENGE_TEXT_RE = /i.?m not a robot|verify (?:you are|you.?re)(?: a)? human|confirm you.?re (?:a )?human|prove you(?: are|.?re)(?: a)? human|checking your browser|just a moment|attention required|unusual traffic|enable javascript(?: and cookies)?|making sure you.?re not a bot|please (?:verify|complete)(?: the)?(?: security)?(?: check)?|bot (?:check|detection)|are you (?:a )?human|human verification|solve (?:the )?(?:pow )?challenge|confirm you.?re a human being|you.?re not a bot|quick check before you continue/i;
+  // Stricter subset used for dialogs: a modal over a normal page is only a challenge
+  // when it says so unambiguously (cookie banners and sign-in prompts must not match).
+  const MODAL_CHALLENGE_TEXT_RE = /i.?m not a robot|not a (?:robot|bot)\b|prove you(?: are|.?re)(?: a)? human|verify (?:you are|you.?re)(?: a)? human|confirm you.?re (?:a )?human|human verification|bot (?:check|detection)/i;
+  const SOLVING_TEXT_RE = /\bverifying\b|verification complete|redirected to/i;
   const AUTO_SOLVE_TEXT_RE = /checking your browser|just a moment|verifying(?: you are human)?|making sure you.?re not a bot|performing security (?:check|verification)|this (?:may|won.?t) take (?:a )?few seconds|proof of work/i;
   const CLICK_TEXT_RE = /i.?m not a robot|verify (?:you are|you.?re)(?: a)? human|verify(?: to continue)?|^verify$|begin(?: verification)?|start(?: verification)?|^continue$|confirm(?: you.?re human)?|pass(?: the)? check/i;
   const CLICK_SKIP_RE = /traditional captcha|privacy|terms|cookie|accept all|reject all|manage (?:cookies|options)|learn more|switch to|sign in|log in|subscribe/i;
@@ -371,6 +375,15 @@
     "#captcha", ".pow-captcha", "[data-pow]", "[name='cf-turnstile-response']",
     "iframe[src*='captcha']"
   ].join(",");
+  // Brave Search shows its proof-of-work check as a modal <dialog> over the fully
+  // rendered results page: there is no widget markup and the page is not "thin", so
+  // it has to be recognised by the dialog and its verify button.
+  const MODAL_SELECTOR = "dialog[open], [role='dialog'], [role='alertdialog'], [aria-modal='true']";
+  const POW_BUTTON_SELECTOR = "button[name='captcha-button'], [data-captcha-button]";
+  // A click starts the in-page proof-of-work; do not click the same control again
+  // while it is still working (a second click would start a second computation).
+  const CLICK_COOLDOWN_MS = 20000;
+  const clickLog = global.__asklocalSerpClicks || (global.__asklocalSerpClicks = new WeakMap());
 
   function pageText(doc) {
     const title = doc.title || "";
@@ -390,6 +403,41 @@
     }
     const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : { width: 1, height: 1 };
     return rect.width >= 2 && rect.height >= 2;
+  }
+
+  // Like isVisible, but for containers: ignore opacity (modals fade in) and size
+  // rules that only make sense for clickable controls.
+  function isRendered(el) {
+    if (!el) return false;
+    const style = el.ownerDocument?.defaultView?.getComputedStyle?.(el);
+    return !(style && (style.visibility === "hidden" || style.display === "none"));
+  }
+
+  function findModalChallenge(doc) {
+    let modals = [];
+    try {
+      modals = Array.from(doc.querySelectorAll(MODAL_SELECTOR));
+    } catch {
+      return null;
+    }
+    for (const modal of modals) {
+      if (!isRendered(modal)) continue;
+      if (modal.querySelector && modal.querySelector(POW_BUTTON_SELECTOR)) return modal;
+      const text = cleanText(modal.innerText || modal.textContent);
+      if (text.length <= 800 && MODAL_CHALLENGE_TEXT_RE.test(text)) return modal;
+    }
+    return null;
+  }
+
+  // True once the page is already computing (or has finished) the check, so the
+  // caller should wait instead of clicking again.
+  function isChallengeSolving(scope) {
+    if (!scope || !scope.querySelector) return false;
+    if (scope.matches && scope.matches("[data-state='verifying'], [data-state='solved']")) return true;
+    if (scope.querySelector("[data-state='verifying'], [data-state='solved'], [aria-busy='true']")) return true;
+    const button = scope.querySelector(POW_BUTTON_SELECTOR);
+    if (button && (button.disabled || button.querySelector("[role='progressbar']"))) return true;
+    return SOLVING_TEXT_RE.test(cleanText(scope.innerText || scope.textContent).slice(0, 600));
   }
 
   function elementLabel(el) {
@@ -427,15 +475,21 @@
     const widget = doc.querySelector(WIDGET_SELECTOR);
     const strongText = CHALLENGE_TEXT_RE.test(doc.title || "") || CHALLENGE_TEXT_RE.test(text);
     const urlHint = challengeUrlHint();
-    const detected = Boolean(puzzle || widget || urlHint || (thinPage && strongText));
-    const autoSolving = Boolean(detected && !puzzle && AUTO_SOLVE_TEXT_RE.test(text));
-    const clickTarget = detected && !puzzle ? findChallengeClickTarget(doc) : null;
+    const modal = findModalChallenge(doc);
+    const detected = Boolean(puzzle || widget || urlHint || modal || (thinPage && strongText));
+    // Over a normal results page the full page text says nothing about the check
+    // ("verifying" is an ordinary word), so judge progress by the dialog alone.
+    const scope = modal || doc.body || doc;
+    const scopeText = modal ? cleanText(modal.innerText || modal.textContent) : text;
+    const solving = Boolean(detected && !puzzle && isChallengeSolving(scope));
+    const autoSolving = Boolean(detected && !puzzle && (solving || AUTO_SOLVE_TEXT_RE.test(scopeText)));
+    const clickTarget = detected && !puzzle && !autoSolving ? findChallengeClickTarget(modal || doc) : null;
 
     let kind = "";
     if (puzzle) kind = "puzzle";
     else if (widget && /turnstile|cloudflare/i.test(widget.outerHTML || widget.className || "")) kind = "turnstile";
     else if (widget && /recaptcha/i.test(widget.outerHTML || widget.className || widget.src || "")) kind = "recaptcha";
-    else if (clickTarget || /not a robot|proof of work|pow/i.test(text)) kind = "pow";
+    else if (modal || clickTarget || /not a robot|proof of work|pow/i.test(scopeText)) kind = "pow";
     else if (autoSolving) kind = "interstitial";
     else if (detected) kind = "challenge";
 
@@ -460,6 +514,7 @@
       const label = elementLabel(el) || elementLabel(el.closest && el.closest("label,button,.cb-lb"));
       if (CLICK_SKIP_RE.test(label)) continue;
       let score = 0;
+      if (el.matches && el.matches(POW_BUTTON_SELECTOR)) score += 8;
       if (CLICK_TEXT_RE.test(label)) score += 6;
       if (/not a robot/i.test(label)) score += 4;
       if (el.matches && el.matches("input[type=checkbox], [role=checkbox]")) score += 2;
@@ -482,8 +537,12 @@
     const opts = { bubbles: true, cancelable: true, view: el.ownerDocument?.defaultView || undefined };
     try { el.dispatchEvent(new MouseEvent("mousedown", opts)); } catch { /* ignore */ }
     try { el.dispatchEvent(new MouseEvent("mouseup", opts)); } catch { /* ignore */ }
-    try { el.dispatchEvent(new MouseEvent("click", opts)); } catch { /* ignore */ }
-    try { if (typeof el.click === "function") el.click(); } catch { /* ignore */ }
+    // Exactly one click. Dispatching a click event and then calling click() fires two
+    // before the page has disabled the button, which starts the proof-of-work twice.
+    try {
+      if (typeof el.click === "function") el.click();
+      else el.dispatchEvent(new MouseEvent("click", opts));
+    } catch { /* ignore */ }
     if (el.tagName === "INPUT" && el.type === "checkbox" && !el.checked) {
       try {
         el.checked = true;
@@ -498,11 +557,21 @@
   function tryPassChallenge(root) {
     const info = inspectChallenge(root);
     if (!info.detected || info.requiresHuman) return { ...info, clicked: false };
+    // The page is already computing the check (or auto-starts it): just wait.
+    if (info.autoSolving) return { ...info, clicked: false };
     const doc = (root && (root.ownerDocument || (root.nodeType === 9 ? root : null)))
       || (typeof document !== "undefined" ? document : null)
       || root;
-    const target = findChallengeClickTarget(doc) || fallbackChallengeClickTarget(doc);
-    return { ...info, clickable: Boolean(target), clicked: realClick(target) };
+    const scope = findModalChallenge(doc) || doc;
+    const target = findChallengeClickTarget(scope) || fallbackChallengeClickTarget(scope);
+    if (!target) return { ...info, clickable: false, clicked: false };
+    const lastClick = clickLog.get(target);
+    if (lastClick && Date.now() - lastClick < CLICK_COOLDOWN_MS) {
+      return { ...info, clickable: true, clicked: false, autoSolving: true };
+    }
+    clickLog.set(target, Date.now());
+    // A click starts the in-page work, so from here on the caller is waiting on it.
+    return { ...info, clickable: true, clicked: realClick(target), autoSolving: true };
   }
 
   function fallbackChallengeClickTarget(doc) {
