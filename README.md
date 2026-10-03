@@ -64,6 +64,19 @@ The first time, open the extension's settings (toolbar icon, then options) and s
 
 Click **Test connection** to check the endpoint and model. A model that supports tool calling gives the best results (web search, opening links, reading media on demand); models without it still answer from the post context.
 
+### Performance
+
+Settings → Performance has a profile that sets how much runs at once:
+
+- **Local model** (default): one model call at a time, which suits a single GPU.
+- **API provider**: for hosted APIs. It runs many vision and audio calls in parallel, captures several videos side by side, analyzes the windows of a long video concurrently, and analyzes more of a thread's media automatically.
+- **Custom**: set the numbers yourself.
+
+Whatever the profile, the X thread, linked articles and every image and video are read concurrently. Analysis of the clicked post's media starts from the page before the thread has loaded. Two optional toggles go further:
+
+- **Start reading the post when the panel opens** begins the thread and media work while you pick a question.
+- **Finish media analysis in the background** (on by default) lets analysis you stopped keep going into the cache.
+
 ### Privacy
 
 AskLocal talks to X in your logged-in browser session and to the model endpoint you configure. Nothing goes to any AskLocal server, because there isn't one. If you point it at a hosted API, your questions and the post context go to that provider. Web search opens your configured search engine in a brief background tab. If the engine shows a proof-of-work "I'm not a robot" check (Brave does), AskLocal clicks it in that background tab and waits for it to finish; image or slider captchas that need a person are not attempted. Background profile scanning and web search are off by default.
@@ -78,6 +91,8 @@ npm run build          # both browsers
 npm run build:chrome   # -> build/chrome + build/asklocal-chrome.zip
 npm run build:firefox  # -> build/firefox + build/asklocal-firefox.zip
 npm run watch:chrome   # rebuild Chrome package on change
+npm test               # parser, cache-identity and orchestration tests (node --test)
+npm run check          # flags identifiers used but never defined
 ```
 
 Load the **built** folder (or zip), not the raw `src/` tree, using the same steps as above. While developing, `npm run watch:chrome` plus **Reload** on the extension card is the quickest loop. For Firefox, `npx web-ext run --source-dir build/firefox --url https://x.com/home` starts a temporary profile with the extension loaded. The Firefox package uses a Manifest V2 wrapper for compatibility.
@@ -121,4 +136,4 @@ Background search is disabled by default. It can be enabled in settings and limi
 
 OpenAI-compatible providers also receive a `get` tool, which opens one or more X posts/threads or web links (by short id or URL) and returns their readable text and top replies to the model as compact text. The prompt already lists every post, media item, and link with its id, so no separate listing or lookup tool is offered.
 
-When media analysis is enabled, OpenAI-compatible base providers also receive `analyze_image` and `analyze_video` tools. AskLocal also pre-processes media on the selected tweet when you click Ask: selected images and videos are both analyzed before the prompt is sent, producing a readable description in context regardless of whether the base model supports vision; images are additionally attached to the main multimodal request when "Use main provider for image analysis" is enabled and the base provider/model supports it. Processed media is cached only in memory for the active AskLocal chat panel/session, released when that panel closes or is replaced, and isolated from other sessions. Image and video analysis can use the main configured model/API or separate image/video provider settings. Videos are analyzed as timestamped in-memory image frame arrays sampled from the video's own natural playback (never by pausing or seeking it, so on-screen playback is never interrupted) plus detected subtitles/captions; the frame interval, maximum frame count (0 = no limit), and frames per minute (scales the count with video length, capped by the max frame count) are configurable in settings.
+When media analysis is enabled, OpenAI-compatible base providers also receive `analyze_image` and `analyze_video` tools. AskLocal also pre-processes media on the selected tweet when you click Ask: selected images and videos are both analyzed before the prompt is sent, producing a readable description in context regardless of whether the base model supports vision; images are additionally attached to the main multimodal request when "Use main provider for image analysis" is enabled and the base provider/model supports it. Finished analyses are saved on this device (IndexedDB) under the media file's own identity, not the post's, so the same image or video in a repost, a quote, or another chat is reused instead of analyzed again. Deleting a chat removes analyses only that chat used, and the settings page can clear the whole cache. Raw image bytes and video frames stay in memory for the panel's session only. Image and video analysis can use the main configured model/API or separate image/video provider settings. Videos are analyzed as timestamped in-memory image frame arrays sampled from the video's own natural playback (never by pausing or seeking it, so on-screen playback is never interrupted) plus detected subtitles/captions; the frame interval, maximum frame count (0 = no limit), and frames per minute (scales the count with video length, capped by the max frame count) are configurable in settings.
