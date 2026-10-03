@@ -34,6 +34,7 @@ export function createProgressReporter(sender, requestId) {
   return async (message, detail = {}) => {
     if (!tabId || !id || !message) return;
     try {
+      const api = globalThis.browser ?? globalThis.chrome;
       await api.tabs.sendMessage(tabId, {
         type: "ASK_LOCAL_PROGRESS",
         requestId: id,
