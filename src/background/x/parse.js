@@ -19,6 +19,16 @@ import {
   normalizePlayableTweetAudioUrl,
   normalizePlayableTweetVideoUrl
 } from "../media/video.js";
+import {
+  readMediaKeys,
+  readMediaSource,
+  readNoteTweet,
+  readQuotedTweet,
+  readRepostedTweet,
+  readTweetAuthor,
+  readTweetId,
+  unwrapTweet
+} from "./schema.js";
 
 export function buildTweetDetailVariables(statusId, cursor = "") {
   const variables = {
@@ -139,8 +149,9 @@ export function collectXTweetResult(result, meta, output) {
   if (!tweet) return;
   output.push(tweet);
 
-  const quotedResult = unwrapXTweetResult(tweetResult?.quoted_status_result?.result);
-  const quoted = normalizeXTweetResult(quotedResult, {
+  // A repost's quote belongs to the reposted post, which normalizeXTweetResult returned.
+  const owner = readRepostedTweet(tweetResult) ?? tweetResult;
+  const quoted = normalizeXTweetResult(readQuotedTweet(owner), {
     ...meta,
     sourceRole: "quoted_post",
     quotedByStatusId: tweet.statusId
@@ -148,38 +159,34 @@ export function collectXTweetResult(result, meta, output) {
   if (quoted) output.push(quoted);
 }
 export function unwrapXTweetResult(result) {
-  let node = result;
-  for (let index = 0; index < 6; index += 1) {
-    if (!node || typeof node !== "object") return null;
-    if (node.legacy || node.rest_id) return node;
-    if (node.tweet_results?.result) {
-      node = node.tweet_results.result;
-      continue;
-    }
-    if (node.result) {
-      node = node.result;
-      continue;
-    }
-    if (node.tweet) {
-      node = node.tweet;
-      continue;
-    }
-    return node;
-  }
-  return node;
+  return unwrapTweet(result);
 }
 export function normalizeXTweetResult(result, meta = {}) {
   if (!result || typeof result !== "object") return null;
+  // A repost carries the reposter as its author and "RT @x: …" as its text. The post
+  // that matters is the original, credited to its own author; who reposted it is kept
+  // on the side.
+  const reposted = readRepostedTweet(result);
+  if (reposted) {
+    const reposter = readTweetAuthor(result);
+    const original = normalizeXTweetResult(reposted, meta);
+    if (!original) return null;
+    return {
+      ...original,
+      repostedBy: reposter.handle,
+      repostStatusId: readTweetId(result)
+    };
+  }
+
   const legacy = result.legacy ?? {};
-  const statusId = String(legacy.id_str || result.rest_id || "");
+  const statusId = readTweetId(result);
   if (!statusId) return null;
-  if (!legacy.full_text && !legacy.conversation_id_str && !result.note_tweet?.note_tweet_results?.result?.text && !result.note_tweet_results?.result?.text) return null;
+  const note = readNoteTweet(result);
+  if (!legacy.full_text && !legacy.conversation_id_str && !note) return null;
 
   const user = extractXTweetUser(result);
   const rawLinks = extractXTweetLinks(result);
-  const noteText = result.note_tweet?.note_tweet_results?.result?.text
-    || result.note_tweet_results?.result?.text
-    || "";
+  const noteText = note?.text || "";
   const rawText = noteText || legacy.full_text || "";
   const { text: visibleText, replyingTo } = splitReplyPrefix(stripMediaShortUrls(rawText, legacy), legacy, !noteText);
   const text = expandXShortUrls(normalizePlainText(visibleText), rawLinks);
@@ -197,8 +204,10 @@ export function normalizeXTweetResult(result, meta = {}) {
     contextId,
     statusId,
     conversationId: String(legacy.conversation_id_str || ""),
+    authorId: user.id,
     authorHandle: user.handle,
     displayName: user.displayName,
+    authorVerified: user.verified,
     url: user.handle ? `https://x.com/${user.handle}/status/${statusId}` : `https://x.com/i/web/status/${statusId}`,
     text,
     postedAt: parseXCreatedAt(legacy.created_at),
@@ -212,7 +221,7 @@ export function normalizeXTweetResult(result, meta = {}) {
     })),
     card: extractXTweetCard(result),
     videoSubtitles: [],
-    media: extractXTweetMedia(result, { contextId, statusId }),
+    media: extractXTweetMedia(result, { contextId, statusId, authorHandle: user.handle }),
     sourceRole: meta.sourceRole || "",
     quotedByStatusId: meta.quotedByStatusId || "",
     // Who this post answers. Without these a thread is just a bag of posts and the
@@ -260,16 +269,12 @@ export function splitReplyPrefix(text, legacy, allowRange = true) {
   };
 }
 export function extractXTweetUser(result) {
-  const userResult = result?.core?.user_results?.result;
-  const legacy = userResult?.legacy ?? {};
-  return {
-    handle: String(legacy.screen_name || "").replace(/^@/, ""),
-    displayName: String(legacy.name || "")
-  };
+  const user = readTweetAuthor(result);
+  return { id: user.id, handle: user.handle, displayName: user.name, verified: user.verified };
 }
 export function extractXTweetLinks(result) {
   const legacy = result?.legacy ?? {};
-  const note = result?.note_tweet?.note_tweet_results?.result ?? result?.note_tweet_results?.result ?? {};
+  const note = readNoteTweet(result) ?? {};
   const urls = [
     ...(legacy.entities?.urls ?? []),
     ...(note.entity_set?.urls ?? [])
@@ -338,7 +343,15 @@ export function normalizeXMediaEntity(item, meta, index) {
   if (!imageUrl && !rawVideoUrls.length) return null;
   const mediaType = isVideo ? "video" : "image";
   const id = `media:${meta.contextId}:${mediaType}:${index + 1}`;
+  const keys = readMediaKeys(item);
+  const source = readMediaSource(item);
+  // Media reused from someone else's post: credit the person who first posted it.
+  const fromElsewhere = source.sourceStatusId && source.sourceStatusId !== meta.statusId;
   return {
+    mediaKey: keys.mediaKey,
+    sourceStatusId: fromElsewhere ? source.sourceStatusId : "",
+    sourceHandle: fromElsewhere ? source.sourceHandle : "",
+    durationMs: Number(item.video_info?.duration_millis || 0) || null,
     id,
     type: mediaType,
     mediaType,
@@ -348,7 +361,7 @@ export function normalizeXMediaEntity(item, meta, index) {
     srcUrl: mediaType === "video" ? rawVideoUrls[0] || "" : "",
     rawVideoUrls,
     rawAudioUrls,
-    mediaId: String(item.id_str || item.id || extractTweetVideoMediaId(imageUrl || rawVideoUrls[0]) || ""),
+    mediaId: String(keys.mediaId || extractTweetVideoMediaId(imageUrl || rawVideoUrls[0]) || ""),
     altText: String(item.ext_alt_text || "").slice(0, 500),
     label: "",
     width: Number(item.original_info?.width || item.sizes?.large?.w || 0) || null,
