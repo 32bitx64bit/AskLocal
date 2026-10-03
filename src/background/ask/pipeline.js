@@ -17,6 +17,11 @@ import {
   countMediaStore
 } from "../media/store.js";
 import {
+  clearXCaptures,
+  exportXCaptures,
+  setXCaptureEnabled
+} from "../x/capture.js";
+import {
   ASKLOCAL_VERSION,
   CLOSED_MEDIA_SESSION_LIMIT
 } from "../constants.js";
@@ -114,6 +119,15 @@ export async function handleMessage(message, sender) {
 
   if (message.type === "CLEAR_MEDIA_CACHE") {
     return { ok: true, ...(await clearPostMediaAnalysisCache()) };
+  }
+
+  if (message.type === "EXPORT_X_CAPTURES") {
+    return { ok: true, captures: await exportXCaptures() };
+  }
+
+  if (message.type === "CLEAR_X_CAPTURES") {
+    await clearXCaptures();
+    return { ok: true };
   }
 
   if (message.type === "CANCEL_ASK") {
@@ -245,6 +259,7 @@ export async function gatherFullContext(context, settings, progress) {
 /** Configure lane limits for the current settings (cheap; called per ask and prefetch). */
 export function applyPerformanceSettings(settings) {
   configureLanes(resolvePerformance(settings).lanes);
+  setXCaptureEnabled(settings.captureXResponses);
 }
 /**
  * Start reading a post in the background as soon as its panel opens, before the user

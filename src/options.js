@@ -79,7 +79,15 @@ const defaultFormSettings = {
   audioProvider: "openai-compatible",
   audioEndpoint: "",
   audioModel: "",
-  audioApiKey: ""
+  audioApiKey: "",
+  performanceProfile: "local",
+  parallelModelCalls: 4,
+  parallelVideoCaptures: 2,
+  autoMediaMaxVideos: 2,
+  autoMediaMaxImages: 4,
+  prefetchOnOpen: false,
+  continueMediaInBackground: true,
+  captureXResponses: false
 };
 
 const fields = [
@@ -107,7 +115,15 @@ const fields = [
   "videoFramesPerMinute",
   "videoFrameIntervalSeconds",
   "videoChunkSeconds",
-  "videoChunkConcurrency"
+  "videoChunkConcurrency",
+  "performanceProfile",
+  "parallelModelCalls",
+  "parallelVideoCaptures",
+  "autoMediaMaxVideos",
+  "autoMediaMaxImages",
+  "prefetchOnOpen",
+  "continueMediaInBackground",
+  "captureXResponses"
 ];
 
 /** @type {{ id: string, name: string, provider: string, endpoint: string, model: string, apiKey: string, usableAsMainText: boolean }[]} */
@@ -160,6 +176,12 @@ async function init() {
       renderModelsList();
       syncMediaModelSelects();
     });
+    document.querySelector("#performanceProfile").addEventListener("change", updatePerformanceFields);
+    document.querySelector("#clearMediaCache").addEventListener("click", clearMediaCache);
+    document.querySelector("#exportXCaptures").addEventListener("click", exportXCaptures);
+    document.querySelector("#clearXCaptures").addEventListener("click", clearXCaptures);
+    updatePerformanceFields();
+    void refreshMediaCacheStatus();
     document.querySelector("#save").addEventListener("click", save);
     document.querySelector("#testConnection").addEventListener("click", testConnection);
   } catch (error) {
@@ -467,6 +489,7 @@ async function save() {
     setForm(savedSettings);
     updateSearchFields();
     updateMediaFields();
+    updatePerformanceFields();
     status.textContent = buildSavedStatus(response, savedSettings);
     setTimeout(() => {
       status.textContent = "";
@@ -720,7 +743,7 @@ function updateMediaFieldGroup(prefix) {
     document.querySelector("#videoFramesPerMinute").disabled = !enabled;
     document.querySelector("#videoFrameIntervalSeconds").disabled = !enabled;
     document.querySelector("#videoChunkSeconds").disabled = !enabled;
-    document.querySelector("#videoChunkConcurrency").disabled = !enabled;
+    updatePerformanceFields();
   }
 
   if (!enabled) {
@@ -800,4 +823,71 @@ function normalizeProvider(value, fallback) {
 function capitalize(value) {
   const text = String(value || "");
   return text ? `${text[0].toUpperCase()}${text.slice(1)}` : "";
+}
+
+function updatePerformanceFields() {
+  const custom = document.querySelector("#performanceProfile").value === "custom";
+  for (const id of ["parallelModelCalls", "parallelVideoCaptures", "autoMediaMaxVideos", "autoMediaMaxImages"]) {
+    document.querySelector(`#${id}`).disabled = !custom;
+  }
+  // Outside Custom the profile sets how many video windows run at once.
+  const videoEnabled = document.querySelector("#allowVideoAnalysis").checked;
+  document.querySelector("#videoChunkConcurrency").disabled = !custom || !videoEnabled;
+}
+
+async function refreshMediaCacheStatus() {
+  const status = document.querySelector("#mediaCacheStatus");
+  try {
+    const response = await api.runtime.sendMessage({ type: "GET_ORCHESTRATION_STATUS" });
+    if (!response?.ok) return;
+    const count = Number(response.mediaCacheEntries || 0);
+    const running = Array.isArray(response.tasks) ? response.tasks.length : 0;
+    status.textContent = `${count} cached media analys${count === 1 ? "is" : "es"}${running ? `, ${running} task${running === 1 ? "" : "s"} running` : ""}`;
+  } catch {
+    status.textContent = "";
+  }
+}
+
+async function clearMediaCache() {
+  const status = document.querySelector("#mediaCacheStatus");
+  try {
+    const response = await api.runtime.sendMessage({ type: "CLEAR_MEDIA_CACHE" });
+    status.textContent = response?.ok ? `Cleared ${response.removed ?? 0}.` : response?.error || "Could not clear the cache.";
+  } catch (error) {
+    status.textContent = error.message || "Could not clear the cache.";
+  }
+}
+
+async function exportXCaptures() {
+  const status = document.querySelector("#xCaptureStatus");
+  try {
+    const response = await api.runtime.sendMessage({ type: "EXPORT_X_CAPTURES" });
+    const captures = Array.isArray(response?.captures) ? response.captures : [];
+    if (!captures.length) {
+      status.textContent = "Nothing recorded yet. Turn on recording, save, then open some posts with AskLocal.";
+      return;
+    }
+    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), captures }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `asklocal-x-captures-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    status.textContent = `Exported ${captures.length} response${captures.length === 1 ? "" : "s"}.`;
+  } catch (error) {
+    status.textContent = error.message || "Could not export.";
+  }
+}
+
+async function clearXCaptures() {
+  const status = document.querySelector("#xCaptureStatus");
+  try {
+    await api.runtime.sendMessage({ type: "CLEAR_X_CAPTURES" });
+    status.textContent = "Cleared.";
+  } catch (error) {
+    status.textContent = error.message || "Could not clear.";
+  }
 }

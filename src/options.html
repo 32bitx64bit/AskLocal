@@ -156,6 +156,57 @@
         <p class="hint">When video analysis runs, AskLocal extracts audio when subtitle coverage is weak or missing, and analyzes it alongside the visuals. Solid detected captions skip the separate audio pass to save tokens. One merge pass (Video merge model) combines both into a single audiovisual report when audio runs. Audio windows follow Seconds per video chunk. Requires an OpenAI-compatible audio-input model.</p>
       </section>
 
+      <section>
+        <h2>Performance</h2>
+        <label>
+          <span>Profile</span>
+          <select id="performanceProfile">
+            <option value="local">Local model (one request at a time)</option>
+            <option value="api">API provider (many requests in parallel)</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+        <p class="hint">Local runs one model call at a time, which suits a single GPU. API runs up to 12 vision and 6 audio calls at once, captures 3 videos side by side, analyzes video windows 6 at a time and analyzes up to 6 videos and 16 images per post. Custom uses the numbers below and the Parallel video chunks setting above.</p>
+        <label>
+          <span>Parallel model calls (custom)</span>
+          <input id="parallelModelCalls" type="number" min="1" max="32" step="1">
+        </label>
+        <label>
+          <span>Parallel video captures (custom)</span>
+          <input id="parallelVideoCaptures" type="number" min="1" max="6" step="1">
+        </label>
+        <label>
+          <span>Videos analyzed automatically per post (custom)</span>
+          <input id="autoMediaMaxVideos" type="number" min="0" max="12" step="1">
+        </label>
+        <label>
+          <span>Images analyzed automatically per post (custom)</span>
+          <input id="autoMediaMaxImages" type="number" min="0" max="32" step="1">
+        </label>
+
+        <div class="section-divider"></div>
+
+        <label class="check"><input id="prefetchOnOpen" type="checkbox"> Start reading the post when the panel opens</label>
+        <p class="hint">Loads the thread and analyzes its media while you choose a question, so the answer starts sooner. This uses model calls even if you close the panel without asking.</p>
+        <label class="check"><input id="continueMediaInBackground" type="checkbox"> Finish media analysis in the background</label>
+        <p class="hint">If you stop an answer or close the panel, media analysis that has already started keeps going and is saved. Asking about the same media later, including reposts and quotes of it, is then instant.</p>
+        <div class="actions-row">
+          <button id="clearMediaCache" type="button" class="secondary">Clear media cache</button>
+          <span id="mediaCacheStatus" class="hint"></span>
+        </div>
+      </section>
+
+      <section>
+        <h2>Diagnostics</h2>
+        <label class="check"><input id="captureXResponses" type="checkbox"> Record raw X responses</label>
+        <p class="hint">Keeps the last 40 thread responses AskLocal reads from X, so they can be exported and used to check AskLocal's parsing when X changes its format. They contain the text and public profile data of the posts you opened, and they stay on this device unless you export them.</p>
+        <div class="actions-row">
+          <button id="exportXCaptures" type="button" class="secondary">Export recorded responses</button>
+          <button id="clearXCaptures" type="button" class="secondary">Clear</button>
+          <span id="xCaptureStatus" class="hint"></span>
+        </div>
+      </section>
+
       <footer>
         <button id="save" type="button">Save</button>
         <span id="status"></span>

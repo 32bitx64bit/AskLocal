@@ -3,6 +3,9 @@ import {
   withLane
 } from "../orchestrator/tasks.js";
 import {
+  recordXCapture
+} from "./capture.js";
+import {
   X_BEARER_RE,
   X_GRAPHQL_ENDPOINT,
   X_GRAPHQL_PAGE_FETCH_TIMEOUT_MS
@@ -66,6 +69,7 @@ async function sendXGraphQL(context, operationName, variables, request) {
     throw new Error(formatXGraphQLRequestError(operationName, result));
   }
 
+  recordXCapture(operationName, variables, result.data);
   return result.data ?? {};
 }
 export async function fetchXGraphQLFromBackground(request, signal) {

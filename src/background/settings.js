@@ -26,6 +26,9 @@ import {
 import {
   SEARCH_ENGINE_REGISTRY
 } from "./search/web-search.js";
+import {
+  normalizePerformanceProfile
+} from "./orchestrator/profile.js";
 
 const DEFAULT_MAIN_MODEL_ID = "default-main";
 
@@ -109,7 +112,20 @@ export const DEFAULT_SETTINGS = {
   audioProvider: "openai-compatible",
   audioEndpoint: "",
   audioModel: "",
-  audioApiKey: ""
+  audioApiKey: "",
+  // Orchestration. "local": one model call at a time (a single GPU). "api": many in
+  // parallel (hosted providers). "custom": the numbers below.
+  performanceProfile: "local",
+  parallelModelCalls: 4,
+  parallelVideoCaptures: 2,
+  autoMediaMaxVideos: 2,
+  autoMediaMaxImages: 4,
+  // Start reading the post and its media when the panel opens, before the question.
+  prefetchOnOpen: false,
+  // Let media analysis finish (into the cache) after the ask that started it stops.
+  continueMediaInBackground: true,
+  // Diagnostics: keep the last raw X responses for export.
+  captureXResponses: false
 };
 export async function openOptionsPage() {
   const url = api.runtime.getURL("options.html");
@@ -361,6 +377,21 @@ export function sanitizeSettings(input) {
 
   if (output.backgroundSearchSource !== undefined) {
     output.backgroundSearchSource = normalizeSearchSource(output.backgroundSearchSource);
+  }
+  if (output.performanceProfile !== undefined) {
+    output.performanceProfile = normalizePerformanceProfile(output.performanceProfile);
+  }
+  if (output.parallelModelCalls !== undefined) {
+    output.parallelModelCalls = Math.floor(clampNumber(output.parallelModelCalls, 1, 32, DEFAULT_SETTINGS.parallelModelCalls));
+  }
+  if (output.parallelVideoCaptures !== undefined) {
+    output.parallelVideoCaptures = Math.floor(clampNumber(output.parallelVideoCaptures, 1, 6, DEFAULT_SETTINGS.parallelVideoCaptures));
+  }
+  if (output.autoMediaMaxVideos !== undefined) {
+    output.autoMediaMaxVideos = Math.floor(clampNumber(output.autoMediaMaxVideos, 0, 12, DEFAULT_SETTINGS.autoMediaMaxVideos));
+  }
+  if (output.autoMediaMaxImages !== undefined) {
+    output.autoMediaMaxImages = Math.floor(clampNumber(output.autoMediaMaxImages, 0, 32, DEFAULT_SETTINGS.autoMediaMaxImages));
   }
   if (output.webSearchEngines !== undefined) {
     output.webSearchEngines = normalizeWebSearchEngines(output.webSearchEngines);
