@@ -10,7 +10,9 @@
     "build:firefox": "node scripts/package.mjs --browser=firefox",
     "build-chrome": "node scripts/package.mjs --browser=chrome",
     "build-firefox": "node scripts/package.mjs --browser=firefox",
-    "watch:chrome": "node scripts/package.mjs --browser=chrome --watch"
+    "watch:chrome": "node scripts/package.mjs --browser=chrome --watch",
+    "check": "node scripts/check-undefined.mjs $(find src -name '*.js')",
+    "test": "node --test test/*.test.js"
   },
   "devDependencies": {
     "acorn": "^8.17.0",
