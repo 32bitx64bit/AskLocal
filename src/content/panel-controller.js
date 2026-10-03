@@ -1,4 +1,11 @@
 import { api } from "./api.js";
+import {
+  extractQuotedTweet,
+  extractTweet
+} from "./tweet-extract.js";
+import {
+  extractStatusIdFromUrl
+} from "./tweet-media.js";
 import { AskLocalGrokStyles } from "../grok/styles.js";
 import { AskLocalGrokShell } from "../grok/shell.js";
 import { AskLocalGrokGeometry } from "../grok/geometry.js";
@@ -77,7 +84,28 @@ async function ensureNativeDocked(options = {}) {
   return Boolean(geometry?.getGrokRect());
 }
 
+/**
+ * Ask the background to start reading this post (thread + media) while the user is
+ * still choosing a question. Ignored there unless prefetch is enabled in settings.
+ */
+export function requestPostPrefetch(article) {
+  if (!article) return;
+  try {
+    sendMessage({
+      type: "PREFETCH_POST",
+      payload: {
+        page: { url: location.href, statusId: extractStatusIdFromUrl(location.href) },
+        tweet: extractTweet(article),
+        quotedTweet: extractQuotedTweet(article),
+        visibleThread: []
+      }
+    }).catch(() => {});
+  } catch {
+    // Prefetch is an optimization; the ask itself still collects everything.
+  }
+}
 export function openPanel(article, anchor, options = {}) {
+  requestPostPrefetch(article);
   // The shell persists for the page session: reopening (Ask button, Grok launcher)
   // reuses the existing host instead of rebuilding it, so a closed shell can be
   // brought back with its conversation intact.
@@ -331,6 +359,7 @@ export function reopenShell(article, options = {}) {
   promoteFromFallbackIfPossible();
 
   if (article !== null && article !== undefined) {
+    requestPostPrefetch(article);
     state.activeShell?.root.__asklocalReset?.(article);
   }
 

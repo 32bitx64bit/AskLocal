@@ -1,11 +1,21 @@
 import { api } from "../api.js";
 import {
   buildContext,
+  createAutomaticMediaRun,
   hydrateThreadAuthorProfiles,
   prepareAutomaticLinkContext,
-  prepareAutomaticMediaContext,
   prepareXPostContext
 } from "../ask/context.js";
+import {
+  resolvePerformance
+} from "../orchestrator/profile.js";
+import {
+  configureLanes,
+  describeTasks
+} from "../orchestrator/tasks.js";
+import {
+  countMediaStore
+} from "../media/store.js";
 import {
   ASKLOCAL_VERSION,
   CLOSED_MEDIA_SESSION_LIMIT
@@ -17,11 +27,10 @@ import {
 } from "../../lib/utils.js";
 import {
   CLOSED_MEDIA_SESSIONS,
-  MEDIA_ANALYSIS_CACHE,
   MEDIA_FRAME_CACHE,
   MEDIA_IMAGE_CACHE,
   MEDIA_SESSION_KEYS,
-  persistMediaAnalysisCache
+  clearPostMediaAnalysisCache
 } from "../media/cache.js";
 import {
   handleVideoCaptureProgress
@@ -93,6 +102,18 @@ export async function handleMessage(message, sender) {
 
   if (message.type === "CACHE_PROFILE_CONTEXT") {
     return cacheProfileContext(message.payload ?? {});
+  }
+
+  if (message.type === "PREFETCH_POST") {
+    return prefetchPost(message.payload ?? {}, sender);
+  }
+
+  if (message.type === "GET_ORCHESTRATION_STATUS") {
+    return { ok: true, ...describeTasks(), mediaCacheEntries: await countMediaStore() };
+  }
+
+  if (message.type === "CLEAR_MEDIA_CACHE") {
+    return { ok: true, ...(await clearPostMediaAnalysisCache()) };
   }
 
   if (message.type === "CANCEL_ASK") {
@@ -186,23 +207,76 @@ export async function clearMediaSession(payload) {
   const keys = MEDIA_SESSION_KEYS.get(mediaSessionId);
   if (!keys) return { ok: true, removed: 0 };
 
+  // Only raw bytes (images, frames) are session-scoped. Finished analyses stay in the
+  // shared cache so a repost or a later chat about the same media is instant.
   let removed = 0;
-  let removedAnalysis = false;
   for (const key of keys) {
-    if (MEDIA_ANALYSIS_CACHE.delete(key)) {
-      removed += 1;
-      removedAnalysis = true;
-    }
     if (MEDIA_IMAGE_CACHE.delete(key)) removed += 1;
     if (MEDIA_FRAME_CACHE.delete(key)) removed += 1;
   }
   MEDIA_SESSION_KEYS.delete(mediaSessionId);
-  if (removedAnalysis) await persistMediaAnalysisCache();
   return { ok: true, removed };
+}
+/**
+ * Everything the first turn about a post needs, gathered concurrently:
+ *
+ *   page media ─────────────┐ (starts from the page's copy of the post right away)
+ *   X thread ──┬─ root/ancestor media ─┤
+ *              └─ author profiles ─────┤
+ *   linked articles ───────────────────┴─> prompt
+ *
+ * Every branch is a shared task, so work a prefetch already started is joined.
+ */
+export async function gatherFullContext(context, settings, progress) {
+  const media = createAutomaticMediaRun(context, settings, progress);
+  media.add();
+  const links = prepareAutomaticLinkContext(context, settings, progress);
+  const thread = (async () => {
+    await prepareXPostContext(context, settings, progress);
+    // The thread brings the root post, ancestors and the API's media URLs.
+    media.add();
+    await hydrateThreadAuthorProfiles(context, settings);
+  })();
+  // Media keeps running throughout; it is awaited last because the thread can still add
+  // to it (only aborts reject).
+  await Promise.all([thread, links]);
+  await media.done();
+}
+/** Configure lane limits for the current settings (cheap; called per ask and prefetch). */
+export function applyPerformanceSettings(settings) {
+  configureLanes(resolvePerformance(settings).lanes);
+}
+/**
+ * Start reading a post in the background as soon as its panel opens, before the user
+ * has typed anything: the X thread and the selected/root/quoted media. The ask that
+ * follows joins these tasks instead of starting over. Results not waited for still go
+ * to the caches.
+ */
+export async function prefetchPost(payload, sender) {
+  const settings = await getSettings();
+  if (!settings.enabled || !settings.prefetchOnOpen || !payload?.tweet) return { ok: true, skipped: true };
+  applyPerformanceSettings(settings);
+  const context = await buildContext({ ...payload, question: "", sourceTabId: sender?.tab?.id ?? null }, settings);
+  context.abortSignal = null;
+  const background = { ...settings, continueMediaInBackground: true };
+  // Not awaited by the panel: errors only matter to the ask that joins later.
+  void (async () => {
+    const media = createAutomaticMediaRun(context, background, null);
+    media.add();
+    try {
+      await prepareXPostContext(context, settings, null);
+      media.add();
+      await media.done();
+    } catch {
+      // Best-effort.
+    }
+  })();
+  return { ok: true, started: true };
 }
 export async function runAskPipeline(payload, sender, controller, progress, emitters = null) {
   const settings = await getSettings();
   if (!settings.enabled) return { disabled: true };
+  applyPerformanceSettings(settings);
 
   await progress("Gathering visible context...");
   const context = await buildContext({
@@ -262,13 +336,7 @@ export async function runAskPipeline(payload, sender, controller, progress, emit
   }
 
   if (includeFullContext) {
-    await prepareXPostContext(context, settings, progress);
-    throwIfAborted(controller.signal);
-    await hydrateThreadAuthorProfiles(context, settings);
-    throwIfAborted(controller.signal);
-    await prepareAutomaticMediaContext(context, settings, progress);
-    throwIfAborted(controller.signal);
-    await prepareAutomaticLinkContext(context, settings, progress);
+    await gatherFullContext(context, settings, progress);
     throwIfAborted(controller.signal);
   } else {
     context.reusedConversationContext = historyPlan.anchorKept;

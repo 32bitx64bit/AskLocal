@@ -31,6 +31,12 @@ import {
   getMediaModel
 } from "../settings.js";
 import {
+  withLane
+} from "../orchestrator/tasks.js";
+import {
+  analyzeMediaShared
+} from "./jobs.js";
+import {
   buildInspectableItems,
   compactMediaRef,
   resolveInspectableMediaTarget,
@@ -68,36 +74,42 @@ export async function analyzeImageTool(args, context, settings) {
     };
   }
 
+  return analyzeMediaShared(target, args, context, settings);
+}
+/**
+ * Analyze one resolved image. Does not touch context.mediaAnalyses: callers (the shared
+ * media job) add the result to every ask waiting for it.
+ */
+export async function analyzeImageTarget(target, args, context, settings) {
   const providerSettings = resolveMediaProviderSettings(settings, "image");
   const cacheKey = buildMediaAnalysisCacheKey("image", target, context, args, providerSettings);
-  const cached = await readCachedMediaAnalysis(cacheKey);
-  if (cached) {
-    context.mediaAnalyses.push(cached);
-    return cached;
-  }
+  const cached = await readCachedMediaAnalysis(cacheKey, target, context);
+  if (cached) return cached;
 
   const image = await loadImageForAnalysis(target, context);
   if (!image.ok) {
     return {
       ok: false,
       tool: "analyze_image",
+      type: "image",
       target: summarizeMediaTarget(target),
       error: image.error
     };
   }
 
   const prompt = buildImageAnalysisPrompt(args.prompt, target, context, {
-    includeQuestion: !args.automatic
+    includeQuestion: !args.automatic,
+    automatic: Boolean(args.automatic)
   });
   await context.reportProgress?.("Analyzing image...");
   const analysisText = await runWithProgressHeartbeat(
-    () => callMediaAnalysisProvider(providerSettings, {
+    () => withLane("vision", () => callMediaAnalysisProvider(providerSettings, {
       kind: "image",
       prompt,
       images: [image],
       target,
       signal: context.abortSignal
-    }),
+    }), context.abortSignal),
     {
       reportProgress: context.reportProgress,
       label: (seconds) => (seconds ? `Still analyzing image — ${seconds}s...` : "Still analyzing image..."),
@@ -114,15 +126,14 @@ export async function analyzeImageTool(args, context, settings) {
     model: `${providerSettings.provider}:${providerSettings.model}`,
     analysis: analysisText
   };
-  await writeCachedMediaAnalysis(cacheKey, result, context.mediaSessionId);
-  context.mediaAnalyses.push(result);
+  await writeCachedMediaAnalysis(cacheKey, result, context, target);
   return result;
 }
 export async function loadImageForAnalysis(target, context) {
   const url = target.imageUrl || target.url || target.posterUrl;
   if (!url) return { ok: false, error: "The image did not have a readable URL." };
   const mediaSessionId = String(context?.mediaSessionId || "").trim();
-  const cacheKey = buildImageDataCacheKey(target, context);
+  const cacheKey = buildImageDataCacheKey(target);
   const cached = MEDIA_IMAGE_CACHE.get(cacheKey);
   if (cached) {
     rememberLimitedCache(MEDIA_IMAGE_CACHE, cacheKey, cached, MEDIA_IMAGE_CACHE_LIMIT, cached.sessionId || mediaSessionId);
@@ -216,61 +227,69 @@ export function extractDataUrlMimeType(dataUrl) {
 }
 export function buildImageAnalysisPrompt(requestPrompt, target, context, options = {}) {
   const includeQuestion = options.includeQuestion !== false;
+  const postContext = formatMediaPostContext(target, context, { includeQuestion, automatic: options.automatic });
   return [
     "Analyze the provided image for AskLocal as factual visual evidence for another model.",
     requestPrompt ? `User/model focus: ${requestPrompt}` : "",
     "Do not answer the user directly unless the focus explicitly asks for it. Describe only what is visible or strongly implied by visible context. Never invent people, text, logos, or off-image events.",
     "Prioritize concrete details that help evaluate claims: subject, actions, setting, layout, relationships, screenshot/UI context, meme/chart/document structure, symbols/logos, and notable visual cues.",
     "Transcribe readable on-screen text exactly when it matters; mark partial/uncertain OCR. Do not invent missing words.",
-    "If this is a screenshot, separate page/app content from browser/UI chrome when relevant.",
+    "If this is a screenshot, separate page/app content from browser/UI chrome when relevant. For a screenshot of a post or chat, name each visible author exactly as shown next to their own words.",
     "Call out uncertainty. Avoid identifying private people unless the image or metadata clearly identifies them.",
+    "Do not say who shared or posted this image; that is tracked separately.",
     "Keep the output compact and scannable. Avoid boilerplate and long raw OCR dumps unless the image is mostly text.",
     "Use this format:",
     "Summary: one sentence with the main visual point / claim-relevant content.",
     "Key visual details: 2-6 bullets with the most relevant objects, people, setting, actions, layout, and cues.",
     "Readable text: exact visible text that matters, grouped by location; write 'none' if there is no readable text.",
     "Context/uncertainty: brief notes about ambiguity, missing context, or likely interpretation vs. fact.",
-    "",
-    formatMediaPostContext(target, context, { includeQuestion }),
+    postContext ? `\n${postContext}` : "",
     "",
     "Image metadata:",
-    JSON.stringify(summarizeMediaTarget(target), null, 2)
+    JSON.stringify(describeMediaForModel(target), null, 2)
   ].filter(Boolean).join("\n");
 }
 
-/** Post/question context for vision models so they know what the clip/image is attached to. */
+/** Media fields that describe the file itself, never the post or person that shared it. */
+export function describeMediaForModel(target) {
+  return {
+    type: target?.mediaType || target?.type || "",
+    altText: target?.altText || "",
+    width: target?.width ?? null,
+    height: target?.height ?? null,
+    durationSeconds: Number(target?.durationMs) > 0 ? Math.round(Number(target.durationMs) / 100) / 10 : null
+  };
+}
+
+/**
+ * Post/question context for vision models so they know what the media is attached to.
+ *
+ * Automatic analyses get none: they are cached by media identity and reused on every
+ * post carrying the same file (reposts, quotes), so they must describe the media alone.
+ * Focused (tool) analyses get the post the media is actually on — never the post the
+ * user clicked, which is often a reply to it.
+ */
 export function formatMediaPostContext(target, context, options = {}) {
+  if (options.automatic || context?.automaticMediaAnalysis) return "";
   const includeQuestion = options.includeQuestion !== false;
   const compact = Boolean(options.compact);
-  const tweet = context?.currentTweet || null;
-  const quoted = context?.quotedTweet || null;
-  const handle = String(target?.authorHandle || tweet?.authorHandle || "").replace(/^@/, "");
-  const postText = String(target?.postText || tweet?.text || "").trim();
+  const handle = String(target?.authorHandle || "").replace(/^@/, "");
+  const postText = String(target?.postText || "").trim();
   const postCap = compact ? 320 : 900;
   const questionCap = compact ? 220 : 500;
   const lines = compact
-    ? ["Post (orientation only):"]
-    : ["Post context (for orientation only — still describe what is visible):"];
+    ? ["Post this media is attached to (orientation only):"]
+    : ["Post this media is attached to (for orientation only — still describe what is visible):"];
 
   if (handle || postText) {
-    lines.push(`@${handle || "unknown"}: ${postText || "(no post text)"}`.slice(0, postCap));
+    lines.push(`${handle ? `@${handle}` : "Unknown author"}: ${postText || "(no post text)"}`.slice(0, postCap));
   } else {
-    lines.push("(no surrounding post text was available)");
-  }
-
-  if (quoted?.text && !compact) {
-    const quotedHandle = String(quoted.authorHandle || "").replace(/^@/, "") || "unknown";
-    lines.push(`Quoted @${quotedHandle}: ${String(quoted.text).trim()}`.slice(0, 500));
-  } else if (quoted?.text && compact) {
-    const quotedHandle = String(quoted.authorHandle || "").replace(/^@/, "") || "unknown";
-    lines.push(`Quoted @${quotedHandle}: ${String(quoted.text).trim()}`.slice(0, 160));
+    lines.push("(the post's text was not available)");
   }
 
   const question = String(context?.originalQuestion || "").trim();
   if (includeQuestion && question) {
     lines.push(`User question (focus only — do not answer): ${question}`.slice(0, questionCap));
-  } else if (question && !compact) {
-    lines.push(`User question for focus only (do not answer it): ${question}`.slice(0, questionCap));
   }
 
   return lines.join("\n");

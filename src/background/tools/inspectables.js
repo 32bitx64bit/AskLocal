@@ -1,3 +1,6 @@
+import {
+  mediaIdentity
+} from "../media/identity.js";
 import { api } from "../api.js";
 import {
   normalizeMediaSubtitleGroups
@@ -167,7 +170,13 @@ function mediaTargetFromAliasRef(context, alias, requestedType) {
 export function mediaAliasForTarget(context, target) {
   if (!target) return "";
   const same = (left, right) => Boolean(left && right && normalizeSourceUrl(left) === normalizeSourceUrl(right));
-  const match = buildInspectableItems(context).media.find((item) => (
+  const items = buildInspectableItems(context).media;
+  // Prefer the item on the same post: the same file can sit on several posts (reposts, quotes).
+  const identity = mediaIdentity(target);
+  const byIdentity = identity ? items.filter((item) => mediaIdentity(item) === identity) : [];
+  const onSamePost = byIdentity.find((item) => target.contextId && item.contextId === target.contextId);
+  if (onSamePost || byIdentity.length) return (onSamePost ?? byIdentity[0]).id || "";
+  const match = items.find((item) => (
     (target.mediaId && item.mediaId === target.mediaId)
     || same(target.url, item.url)
     || same(target.srcUrl, item.srcUrl)
@@ -346,7 +355,11 @@ export function normalizeMediaItemForInspection(media, meta) {
     srcUrl: mediaType === "video" ? srcUrl : "",
     rawVideoUrls,
     rawAudioUrls,
-    mediaId: mediaType === "video" ? String(media.mediaId || extractTweetVideoMediaId(srcUrl || posterUrl || url) || "") : "",
+    mediaId: String(media.mediaId || (mediaType === "video" ? extractTweetVideoMediaId(srcUrl || posterUrl || url) : "") || ""),
+    mediaKey: String(media.mediaKey || ""),
+    sourceStatusId: String(media.sourceStatusId || ""),
+    sourceHandle: String(media.sourceHandle || "").replace(/^@/, ""),
+    durationMs: Number(media.durationMs) > 0 ? Number(media.durationMs) : null,
     altText: String(media.altText || media.alt || "").trim().slice(0, 500),
     label: String(media.label || media.ariaLabel || "").trim().slice(0, 240),
     authorHandle: String(meta.authorHandle || "").replace(/^@/, ""),
@@ -706,6 +719,9 @@ export function summarizeMediaTarget(target) {
     posterUrl: target.posterUrl,
     srcUrl: target.srcUrl,
     mediaId: target.mediaId,
+    mediaKey: target.mediaKey,
+    sourceStatusId: target.sourceStatusId,
+    sourceHandle: target.sourceHandle,
     sequenceIndex: target.sequenceIndex,
     altText: target.altText,
     label: target.label,

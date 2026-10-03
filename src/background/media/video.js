@@ -47,15 +47,11 @@ import {
   MEDIA_FRAME_CACHE,
   VIDEO_CAPTURE_PROGRESS_HANDLERS,
   buildMediaAnalysisCacheKey,
-  buildPostMediaAnalysisCacheKey,
-  canPersistPostMediaAnalysis,
   findExistingMediaAnalysis,
   mediaCacheFingerprint,
   readCachedMediaAnalysis,
-  readPostMediaAnalysis,
   rememberLimitedCache,
-  writeCachedMediaAnalysis,
-  writePostMediaAnalysis
+  writeCachedMediaAnalysis
 } from "../media/cache.js";
 import {
   callMediaAnalysisProvider,
@@ -74,6 +70,15 @@ import {
 import {
   isFatalMediaProviderError
 } from "../providers/errors.js";
+import {
+  withLane
+} from "../orchestrator/tasks.js";
+import {
+  resolvePerformance
+} from "../orchestrator/profile.js";
+import {
+  analyzeMediaShared
+} from "./jobs.js";
 import {
   buildInspectableItems,
   compactMediaRef,
@@ -100,6 +105,13 @@ export async function analyzeVideoTool(args, context, settings) {
   const existing = findExistingMediaAnalysis(context, target, "video");
   if (existing) return compactReusedVideoToolResult(existing);
 
+  return analyzeMediaShared(target, args, context, settings);
+}
+/**
+ * Analyze one resolved video (frames, plus audio when enabled). Does not touch
+ * context.mediaAnalyses: the shared media job adds the result to every waiting ask.
+ */
+export async function analyzeVideoTarget(target, args, context, settings) {
   const maxFrames = Math.floor(clampNumber(args.max_frames ?? args.maxFrames ?? settings.maxVideoFrames, 0, Infinity, settings.maxVideoFrames));
   const frameIntervalSeconds = clampNumber(
     args.frame_interval_seconds ?? args.frameIntervalSeconds ?? settings.videoFrameIntervalSeconds,
@@ -115,7 +127,7 @@ export async function analyzeVideoTool(args, context, settings) {
     settings.videoChunkSeconds
   );
   const chunkConcurrency = Math.floor(clampNumber(
-    args.chunk_concurrency ?? args.chunkConcurrency ?? settings.videoChunkConcurrency,
+    args.chunk_concurrency ?? args.chunkConcurrency ?? resolvePerformance(settings).videoChunkConcurrency,
     MIN_VIDEO_CHUNK_CONCURRENCY,
     MAX_VIDEO_CHUNK_CONCURRENCY,
     settings.videoChunkConcurrency ?? DEFAULT_VIDEO_CHUNK_CONCURRENCY
@@ -140,29 +152,8 @@ export async function analyzeVideoTool(args, context, settings) {
       : ""
   };
   const cacheKey = buildMediaAnalysisCacheKey("video", target, context, args, providerSettings, cacheExtra);
-  const postCacheKey = canPersistPostMediaAnalysis(target)
-    ? buildPostMediaAnalysisCacheKey("video", target, context, args, providerSettings, cacheExtra)
-    : "";
-
-  const cached = await readCachedMediaAnalysis(cacheKey);
-  if (cached) {
-    context.mediaAnalyses.push(cached);
-    return cached;
-  }
-
-  if (postCacheKey) {
-    const postCached = await readPostMediaAnalysis(postCacheKey);
-    if (postCached) {
-      // Also warm the session cache so same-session follow-ups stay local.
-      await writeCachedMediaAnalysis(cacheKey, {
-        ...postCached,
-        cached: false,
-        reusedFromPost: false
-      }, context.mediaSessionId);
-      context.mediaAnalyses.push(postCached);
-      return postCached;
-    }
-  }
+  const cached = await readCachedMediaAnalysis(cacheKey, target, context);
+  if (cached) return cached;
 
   return runPipelinedVideoAudioAnalysis({
     args,
@@ -179,8 +170,7 @@ export async function analyzeVideoTool(args, context, settings) {
     providerSettings,
     mergeProviderSettings,
     audioProviderSettings,
-    cacheKey,
-    postCacheKey
+    cacheKey
   });
 }
 
@@ -203,8 +193,7 @@ export async function runPipelinedVideoAudioAnalysis({
   providerSettings,
   mergeProviderSettings,
   audioProviderSettings,
-  cacheKey,
-  postCacheKey
+  cacheKey
 }) {
   const concurrency = Math.floor(clampNumber(
     chunkConcurrency,
@@ -487,8 +476,7 @@ export async function runPipelinedVideoAudioAnalysis({
         analysisRun,
         audioRun,
         audioError,
-        cacheKey,
-        postCacheKey
+        cacheKey
       });
     }
     return {
@@ -645,8 +633,7 @@ export async function runPipelinedVideoAudioAnalysis({
     analysisRun,
     audioRun,
     audioError,
-    cacheKey,
-    postCacheKey
+    cacheKey
   });
 }
 
@@ -664,8 +651,7 @@ async function finalizeVideoAnalysisResult({
   analysisRun,
   audioRun,
   audioError,
-  cacheKey,
-  postCacheKey
+  cacheKey
 }) {
   const audioIncluded = Boolean(
     analysisRun.avMerged
@@ -696,14 +682,7 @@ async function finalizeVideoAnalysisResult({
     audioError: audioIncluded ? "" : audioError,
     pipelined: true
   };
-  await writeCachedMediaAnalysis(cacheKey, result, context.mediaSessionId);
-  if (postCacheKey) {
-    await writePostMediaAnalysis(postCacheKey, result, {
-      sourceChatId: context.chatId || "",
-      target
-    });
-  }
-  context.mediaAnalyses.push(result);
+  await writeCachedMediaAnalysis(cacheKey, result, context, target);
   return result;
 }
 export async function runVideoAnalysis({
@@ -1308,7 +1287,12 @@ export async function runWithConcurrency(total, concurrency, worker) {
   await Promise.all(Array.from({ length: Math.min(limit, total) }, () => runOne()));
 }
 
+/** One vision (frames) or text-only merge call, run in its orchestration lane. */
 export async function callVideoChunkAnalysis(providerSettings, request, options = {}) {
+  const lane = Array.isArray(request.images) && request.images.length ? "vision" : "text";
+  return withLane(lane, () => callVideoChunkAnalysisNow(providerSettings, request, options), request.signal);
+}
+async function callVideoChunkAnalysisNow(providerSettings, request, options = {}) {
   const timeoutMs = clampNumber(options.timeoutMs, 30_000, 15 * 60_000, MEDIA_ANALYSIS_CHUNK_TIMEOUT_MS);
   const heartbeatMs = clampNumber(options.heartbeatMs, 5_000, 60_000, MEDIA_ANALYSIS_CHUNK_HEARTBEAT_MS);
   const label = options.label || "video analysis";
@@ -1401,7 +1385,6 @@ export function groupVideoFramesIntoChunks(frames, chunkSeconds) {
 }
 export function buildVideoFrameCacheKey(target, context, maxFrames, frameIntervalSeconds, framesPerMinute, options = {}) {
   return `${MEDIA_CACHE_PREFIX}frames:${stableHash(JSON.stringify({
-    sessionId: context.mediaSessionId || "",
     media: mediaCacheFingerprint(target),
     maxFrames,
     frameIntervalSeconds,
@@ -1450,9 +1433,10 @@ export async function collectVideoAnalysisFrames(target, context, maxFrames, fra
   let audioError = "";
 
   if (directUrls.length) {
+    activeCaptureUsers += 1;
     try {
       for (const directUrl of directUrls) {
-        const capture = await captureVideoFromDirectUrl(
+        const capture = await withLane("capture", () => captureVideoFromDirectUrl(
           directUrl,
           maxFrames,
           frameIntervalSeconds,
@@ -1467,7 +1451,7 @@ export async function collectVideoAnalysisFrames(target, context, maxFrames, fra
             onAudioChunk: options.onAudioChunk,
             onCaptureMeta: options.onCaptureMeta
           }
-        );
+        ), context.abortSignal);
         const bgFrames = Array.isArray(capture) ? capture : (capture.frames || []);
         if (!bgFrames.length && !(capture.audioChunks || []).length) continue;
         bgFrames.forEach(addFrame);
@@ -1482,7 +1466,10 @@ export async function collectVideoAnalysisFrames(target, context, maxFrames, fra
         error = "Opened raw video URL, but no readable frames were captured.";
       }
     } finally {
-      await releaseVideoCaptureTab();
+      activeCaptureUsers = Math.max(0, activeCaptureUsers - 1);
+      // Firefox captures in a shared background tab; closing it under another
+      // video's capture would kill that capture.
+      if (!activeCaptureUsers) await releaseVideoCaptureTab();
     }
   } else {
     error = "No raw video.twimg.com MP4 URL was resolved for this X video.";
@@ -1779,6 +1766,8 @@ export function extractTweetVideoMediaId(value) {
   }
 }
 export let videoCaptureOffscreenPromise = null;
+/** Videos currently capturing through the shared capture host. */
+let activeCaptureUsers = 0;
 export let videoCaptureTabId = null;
 export let videoCaptureTabPromise = null;
 
@@ -2160,13 +2149,10 @@ export function trimStitchedAnalysis(text, cap) {
 
 export function formatCompactVideoMediaLine(target) {
   if (!target) return "Video: (unknown)";
-  const handle = String(target.authorHandle || "").replace(/^@/, "");
-  const parts = [
-    handle ? `@${handle}` : "",
-    target.id ? `id=${target.id}` : "",
-    target.mediaId ? `media=${target.mediaId}` : ""
-  ].filter(Boolean);
-  return `Video: ${parts.join(" ") || "selected clip"}`;
+  // Who posted the clip is tracked outside the analysis; naming them here made vision
+  // models attribute the clip's content to whoever shared it.
+  const seconds = Number(target.durationMs) > 0 ? Math.round(Number(target.durationMs) / 1000) : 0;
+  return `Video${seconds ? ` (${seconds}s)` : ""}${target.altText ? `, alt text: ${String(target.altText).slice(0, 200)}` : ""}`;
 }
 
 /** Enough timed caption text that a separate audio pass is usually redundant. */

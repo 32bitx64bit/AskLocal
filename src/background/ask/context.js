@@ -12,13 +12,24 @@ import {
   uniqueBy
 } from "../../lib/utils.js";
 import {
-  analyzeImageTool,
   loadImageForAnalysis
 } from "../media/image.js";
 import {
-  analyzeVideoTool,
+  mediaCacheIdentity
+} from "../media/identity.js";
+import {
+  analyzeMediaShared
+} from "../media/jobs.js";
+import {
   extractTweetVideoMediaId
 } from "../media/video.js";
+import {
+  resolvePerformance
+} from "../orchestrator/profile.js";
+import {
+  runTask,
+  withLane
+} from "../orchestrator/tasks.js";
 import {
   inferPromptPresetFromQuestion,
   normalizePromptPreset,
@@ -87,29 +98,119 @@ export async function buildContext(payload, settings) {
   normalizeContextTweets(context);
   return context;
 }
-export async function prepareAutomaticMediaContext(context, settings, progress) {
-  const media = getSelectedAutomaticMedia(context);
-  context.automaticMedia.selectedCount = media.length;
-  if (!media.length) return;
+/**
+ * Automatic media analysis for one ask, run in parallel (within the lane limits).
+ *
+ * `add()` can be called again as more of the thread arrives: the clicked post's media
+ * starts from the page data straight away, and the thread root's / ancestors' media
+ * joins once the X thread is loaded. Each item is a shared task (media/jobs.js), so
+ * media a prefetch already started is joined, not restarted.
+ */
+export function createAutomaticMediaRun(context, settings, progress) {
+  const started = new Map();
+  const perf = resolvePerformance(settings);
+  const caps = { video: perf.autoMediaMaxVideos, image: perf.autoMediaMaxImages };
+  const counts = { video: 0, image: 0 };
+  let finished = 0;
 
-  const images = media.filter((item) => item.mediaType === "image");
-  const videos = media.filter((item) => item.mediaType === "video");
+  const report = (message) => void progress?.(message);
+  const statusLine = () => {
+    const total = started.size;
+    return total > 1 ? `Analyzing media (${finished} of ${total} done)...` : "";
+  };
 
-  if (images.length && settings.allowImageAnalysis) {
-    // Always run an explicit analysis (mirroring automatic video handling below) so every
-    // selected image ends up with a readable description in context, not just raw bytes
-    // that a non-vision base model would silently ignore.
-    await analyzeAutomaticImages(context, settings, images, progress);
-    if (shouldAttachImagesToMainProvider(settings)) {
-      await progress?.(`Loading ${images.length} selected image${images.length === 1 ? "" : "s"}...`);
-      await attachAutomaticImages(context, images);
+  const runOne = async (item, label) => {
+    const automatic = item.mediaType === "video"
+      ? { automatic: true, prompt: AUTOMATIC_VIDEO_PROMPT }
+      : { automatic: true, prompt: AUTOMATIC_IMAGE_PROMPT };
+    // Several items in flight: prefix their progress so lines stay readable.
+    const itemContext = {
+      ...context,
+      reportProgress: (message) => report(started.size > 1 ? `${label}: ${message}` : message)
+    };
+    try {
+      const result = await analyzeMediaShared(item, automatic, itemContext, settings);
+      if (result?.ok) {
+        if (item.mediaType === "video") {
+          context.automaticMedia.analyzedVideoCount += 1;
+          if (result.audioMergedIntoAnalysis || result.audioAnalysis) context.automaticMedia.analyzedAudioCount += 1;
+          else if (result.audioError) context.automaticMedia.errors.push({ type: "audio", id: item.id, error: result.audioError });
+        } else {
+          context.automaticMedia.analyzedImageCount += 1;
+        }
+        if (result.cached) context.automaticMedia.cachedAnalysisCount += 1;
+      } else {
+        context.automaticMedia.errors.push({ type: item.mediaType, id: item.id, error: result?.error || `${label} analysis failed.` });
+      }
+    } catch (error) {
+      if (context.abortSignal?.aborted || error?.name === "AbortError") throw error;
+      context.automaticMedia.errors.push({ type: item.mediaType, id: item.id, error: error.message });
+      context.mediaAnalyses.push({
+        ok: false,
+        tool: `automatic_${item.mediaType}_analysis`,
+        type: item.mediaType,
+        target: summarizeMediaTarget(item),
+        error: error.message
+      });
+    } finally {
+      finished += 1;
+      const line = statusLine();
+      if (line) report(line);
     }
-  }
+  };
 
-  if (videos.length && settings.allowVideoAnalysis) {
-    await analyzeAutomaticVideos(context, settings, videos, progress);
-  }
+  const attachments = [];
+  return {
+    /** Start analysis for selected media not started yet. */
+    add() {
+      const media = getSelectedAutomaticMedia(context);
+      for (const item of media) {
+        const type = item.mediaType;
+        if (type === "image" && !settings.allowImageAnalysis) continue;
+        if (type === "video" && !settings.allowVideoAnalysis) continue;
+        if (type !== "image" && type !== "video") continue;
+        const key = mediaCacheIdentity(item);
+        if (started.has(key) || counts[type] >= caps[type]) continue;
+        counts[type] += 1;
+        const label = `${type === "video" ? "Video" : "Image"} ${counts[type]}`;
+        const running = runOne(item, label);
+        // Awaited in done(); until then an abort must not surface as unhandled.
+        running.catch(() => {});
+        started.set(key, running);
+        if (type === "image" && shouldAttachImagesToMainProvider(settings)) {
+          const attaching = attachAutomaticImages(context, [item]);
+          attaching.catch(() => {});
+          attachments.push(attaching);
+        }
+      }
+      context.automaticMedia.selectedCount = started.size;
+    },
+    /** Resolves when every started analysis has settled (rejects only on abort). */
+    async done() {
+      let size = -1;
+      // Analyses can be added while waiting; wait until the set stops growing.
+      while (size !== started.size + attachments.length) {
+        size = started.size + attachments.length;
+        await Promise.all([...started.values(), ...attachments]);
+      }
+    },
+    get size() {
+      return started.size;
+    }
+  };
 }
+export async function prepareAutomaticMediaContext(context, settings, progress) {
+  const run = createAutomaticMediaRun(context, settings, progress);
+  run.add();
+  await run.done();
+}
+const AUTOMATIC_IMAGE_PROMPT = "Automatic reusable image notes. Prioritize factual visual details, readable text, screenshot/UI/meme structure, notable people/objects/actions, and uncertainty. Do not invent missing text or off-image events. Do not answer the user directly.";
+const AUTOMATIC_VIDEO_PROMPT = [
+  "Produce compact change-based visual notes of this video for another model that cannot see the frames.",
+  "Summarize the window, then list only meaningful visual changes and key moments with timestamps — not one detailed bullet per sample.",
+  "Prefer provided subtitle/caption cues for speech-like text; OCR only distinct burned-in text that is missing or differs.",
+  "Do not invent spoken audio. Be concrete and uncertainty-aware. Do not answer the user directly."
+].join(" ");
 export async function prepareAutomaticLinkContext(context, settings, progress) {
   if (!settings.autoReadLinks) return;
   if (!context.currentTweet) return;
@@ -131,14 +232,14 @@ export async function prepareAutomaticLinkContext(context, settings, progress) {
   (context.currentTweet.links ?? []).forEach((link) => add(link.url, link.displayUrl));
   if (context.currentTweet.card?.url) add(context.currentTweet.card.url, context.currentTweet.card.title);
 
-  // Keep it fast: at most 2 links for the current post.
+  // Keep it fast: at most 2 links for the current post, read side by side.
   const toFetch = candidates.slice(0, 2);
-  for (const [index, candidate] of toFetch.entries()) {
+  if (toFetch.length) await progress?.(`Reading ${toFetch.length === 1 ? "linked article" : `${toFetch.length} linked articles`}...`);
+  await Promise.all(toFetch.map(async (candidate) => {
     throwIfAborted(context.abortSignal);
     try {
-      await progress?.(`Reading linked article ${index + 1} of ${toFetch.length}...`);
       const maxChars = 8000;
-      const page = await collectWebPageInBackground(candidate.url, maxChars);
+      const page = await withLane("web", () => collectWebPageInBackground(candidate.url, maxChars), context.abortSignal);
       const result = {
         ok: page.ok,
         tool: "automatic_link_read",
@@ -157,7 +258,7 @@ export async function prepareAutomaticLinkContext(context, settings, progress) {
         error: error.message || "Failed to read article."
       });
     }
-  }
+  }));
 }
 export async function prepareXPostContext(context, settings, progress) {
   const statusId = context.currentTweet?.statusId || extractStatusIdFromUrl(context.currentTweet?.url) || extractStatusIdFromUrl(context.sourcePage?.url);
@@ -166,15 +267,21 @@ export async function prepareXPostContext(context, settings, progress) {
 
   try {
     await progress?.("Reading X post context...");
-    const xContext = await collectXPostContextInBackground({
+    const target = {
       statusId,
       url: context.currentTweet?.url || context.sourcePage?.url,
       authorHandle: context.currentTweet?.authorHandle || ""
-    }, {
-      maxReplies: 12,
-      maxRankedReplies: 8,
-      maxPages: 2
-    }, context);
+    };
+    // Shared task: a prefetch for this post (or another tab) may already be reading it.
+    const xContext = await runTask(`thread:${statusId}`, {
+      signal: context.abortSignal,
+      background: true,
+      run: ({ signal }) => collectXPostContextInBackground(target, {
+        maxReplies: 12,
+        maxRankedReplies: 8,
+        maxPages: 2
+      }, { sourceTabId: context.sourceTabId, abortSignal: signal })
+    });
 
     context.xPostContext = xContext;
     if (xContext?.ok) {
@@ -254,21 +361,38 @@ export function mergeXPostContextIntoAskContext(context, xContext, settings) {
     ], (tweet) => tweet.statusId || tweet.contextId);
   }
 }
+/**
+ * Combine the page's copy of a post (`existing`) with X's API copy (`fresh`). The API
+ * copy wins field by field, but only where it actually has a value: an empty author
+ * from the API must never erase the handle read from the page.
+ */
 export function mergeContextTweet(existing, fresh) {
   if (!existing) return fresh;
   if (!fresh) return existing;
+  const pick = (key) => (hasValue(fresh[key]) ? fresh[key] : existing[key]);
+  const merged = { ...existing };
+  for (const key of Object.keys(fresh)) {
+    if (hasValue(fresh[key])) merged[key] = fresh[key];
+  }
   return pruneEmptyValues({
-    ...existing,
-    ...fresh,
-    text: fresh.text || existing.text,
+    ...merged,
+    authorHandle: pick("authorHandle"),
+    displayName: pick("displayName"),
+    url: fresh.authorHandle ? fresh.url : existing.url || fresh.url,
+    text: pick("text"),
     links: fresh.links?.length ? fresh.links : existing.links,
     card: fresh.card || existing.card,
     media: fresh.media?.length ? fresh.media : existing.media,
     videoSubtitles: fresh.videoSubtitles?.length ? fresh.videoSubtitles : existing.videoSubtitles,
-    engagement: fresh.engagement || existing.engagement,
-    postedAt: fresh.postedAt || existing.postedAt,
-    textTruncated: Boolean(existing.textTruncated || fresh.textTruncated)
+    engagement: pick("engagement"),
+    postedAt: pick("postedAt"),
+    textTruncated: Boolean(existing.textTruncated && fresh.textTruncated)
   });
+}
+function hasValue(value) {
+  if (value === null || value === undefined || value === "") return false;
+  if (Array.isArray(value)) return value.length > 0;
+  return true;
 }
 /**
  * Media to analyze automatically before the main model answers.
@@ -318,10 +442,16 @@ export function getSelectedAutomaticMedia(context) {
   push(byStatus(quotedStatusId));
   push(available.filter((item) => item.source === "quoted_post"));
 
-  // Keep auto cost bounded: selected/root/quoted media only, prefer videos then images, cap total.
-  const videos = selected.filter((item) => item.mediaType === "video");
-  const images = selected.filter((item) => item.mediaType === "image");
-  return [...videos.slice(0, 2), ...images.slice(0, 4)];
+  // 4) The reply chain between the root and the selected post, nearest first: what the
+  //    selected post is answering often lives in an ancestor's image or clip.
+  const parents = [...(context.xPostContext?.parents ?? [])].reverse();
+  for (const parent of parents) push(byStatus(String(parent?.statusId || "")));
+
+  // Videos first (slowest), then images; the run applies the profile's caps.
+  return [
+    ...selected.filter((item) => item.mediaType === "video"),
+    ...selected.filter((item) => item.mediaType === "image")
+  ];
 }
 export function shouldAttachImagesToMainProvider(settings) {
   return Boolean(settings.allowImageAnalysis && settings.imageUseBaseProvider);
@@ -352,78 +482,6 @@ export async function attachAutomaticImages(context, images) {
     });
     context.automaticMedia.attachedImageCount += 1;
     if (loaded.cached) context.automaticMedia.cachedImageCount += 1;
-  }
-}
-export async function analyzeAutomaticImages(context, settings, images, progress) {
-  for (const [index, image] of images.entries()) {
-    throwIfAborted(context.abortSignal);
-    try {
-      await progress?.(`Checking image ${index + 1} of ${images.length}...`);
-      const result = await analyzeImageTool({
-        id: image.id,
-        automatic: true,
-        prompt: "Automatic reusable image notes. Prioritize factual visual details, readable text, screenshot/UI/meme structure, notable people/objects/actions, and uncertainty. Do not invent missing text or off-image events. Do not answer the user directly."
-      }, context, settings);
-      await progress?.(result.cached
-        ? `Using cached image analysis ${index + 1} of ${images.length}...`
-        : `Analyzing image ${index + 1} of ${images.length}...`);
-      if (result.ok) {
-        context.automaticMedia.analyzedImageCount += 1;
-        if (result.cached) context.automaticMedia.cachedAnalysisCount += 1;
-      }
-      else context.automaticMedia.errors.push({ type: "image", id: image.id, error: result.error || "Image analysis failed." });
-    } catch (error) {
-      context.automaticMedia.errors.push({ type: "image", id: image.id, error: error.message });
-      context.mediaAnalyses.push({
-        ok: false,
-        tool: "automatic_image_analysis",
-        type: "image",
-        target: summarizeMediaTarget(image),
-        error: error.message
-      });
-    }
-  }
-}
-export async function analyzeAutomaticVideos(context, settings, videos, progress) {
-  for (const [index, video] of videos.entries()) {
-    throwIfAborted(context.abortSignal);
-    try {
-      await progress?.(`Checking video ${index + 1} of ${videos.length}...`);
-      const result = await analyzeVideoTool({
-        id: video.id,
-        automatic: true,
-        prompt: [
-          "Produce compact change-based visual notes of this video for another model that cannot see the frames.",
-          "Summarize the window, then list only meaningful visual changes and key moments with timestamps — not one detailed bullet per sample.",
-          "Prefer provided subtitle/caption cues for speech-like text; OCR only distinct burned-in text that is missing or differs.",
-          "Do not invent spoken audio. Be concrete and uncertainty-aware. Do not answer the user directly."
-        ].join(" ")
-      }, context, settings);
-      await progress?.(result.cached
-        ? (result.reusedFromPost
-          ? `Reusing saved video analysis ${index + 1} of ${videos.length}...`
-          : `Using cached video analysis ${index + 1} of ${videos.length}...`)
-        : `Processing video ${index + 1} of ${videos.length}...`);
-      if (result.ok) {
-        context.automaticMedia.analyzedVideoCount += 1;
-        if (result.audioMergedIntoAnalysis || result.audioAnalysis) {
-          context.automaticMedia.analyzedAudioCount += 1;
-        } else if (result.audioError) {
-          context.automaticMedia.errors.push({ type: "audio", id: video.id, error: result.audioError });
-        }
-        if (result.cached) context.automaticMedia.cachedAnalysisCount += 1;
-      }
-      else context.automaticMedia.errors.push({ type: "video", id: video.id, error: result.error || "Video analysis failed." });
-    } catch (error) {
-      context.automaticMedia.errors.push({ type: "video", id: video.id, error: error.message });
-      context.mediaAnalyses.push({
-        ok: false,
-        tool: "automatic_video_analysis",
-        type: "video",
-        target: summarizeMediaTarget(video),
-        error: error.message
-      });
-    }
   }
 }
 export function shouldUseVisibleThread(payload) {
@@ -530,7 +588,11 @@ export function normalizeTweetMediaItem(item, meta) {
     srcUrl: mediaType === "video" ? srcUrl : "",
     rawVideoUrls,
     rawAudioUrls,
-    mediaId: mediaType === "video" ? String(item.mediaId || extractTweetVideoMediaId(srcUrl || posterUrl || url) || "") : "",
+    mediaId: String(item.mediaId || (mediaType === "video" ? extractTweetVideoMediaId(srcUrl || posterUrl || url) : "") || ""),
+    mediaKey: String(item.mediaKey || ""),
+    sourceStatusId: String(item.sourceStatusId || ""),
+    sourceHandle: String(item.sourceHandle || "").replace(/^@/, ""),
+    durationMs: Number(item.durationMs) > 0 ? Number(item.durationMs) : null,
     altText: String(item.altText || item.alt || "").trim().slice(0, 500),
     label: String(item.label || item.ariaLabel || "").trim().slice(0, 240),
     width: Number.isFinite(Number(item.width)) ? Number(item.width) : null,

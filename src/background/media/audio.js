@@ -14,6 +14,7 @@ import {
 } from "../../lib/utils.js";
 import {
   callAudioAnalysisProvider,
+  describeMediaForModel,
   formatMediaPostContext
 } from "./image.js";
 import {
@@ -22,6 +23,9 @@ import {
 import {
   isFatalMediaProviderError
 } from "../providers/errors.js";
+import {
+  withLane
+} from "../orchestrator/tasks.js";
 import {
   summarizeMediaTarget
 } from "../tools/inspectables.js";
@@ -399,7 +403,12 @@ async function runParallelAudioAnalysis({
   };
 }
 
+/** One audio (or text-only audio merge) call, run in its orchestration lane. */
 export async function callAudioChunkAnalysis(providerSettings, request, options = {}) {
+  const lane = Array.isArray(request.audioChunks) && request.audioChunks.length ? "audio" : "text";
+  return withLane(lane, () => callAudioChunkAnalysisNow(providerSettings, request, options), request.signal);
+}
+async function callAudioChunkAnalysisNow(providerSettings, request, options = {}) {
   const timeoutMs = clampNumber(options.timeoutMs, 30_000, 15 * 60_000, MEDIA_ANALYSIS_CHUNK_TIMEOUT_MS);
   const heartbeatMs = clampNumber(options.heartbeatMs, 5_000, 60_000, MEDIA_ANALYSIS_CHUNK_HEARTBEAT_MS);
   const label = options.label || "audio analysis";
@@ -545,7 +554,7 @@ export function buildAudioAnalysisPrompt(requestPrompt, target, context, chunk, 
     "",
     `Audio window: ${rangeLabel}`,
     "Video metadata:",
-    JSON.stringify(summarizeMediaTarget(target), null, 2)
+    JSON.stringify(describeMediaForModel(target), null, 2)
   ].filter(Boolean).join("\n");
 }
 

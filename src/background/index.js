@@ -12,6 +12,15 @@ import {
 import {
   DEFAULT_SETTINGS
 } from "./settings.js";
+import {
+  setTaskKeepAlive
+} from "./orchestrator/tasks.js";
+
+// Background tasks (prefetch, media finishing after its ask stopped) run with no Port
+// open. Any extension API call resets Chrome's ~30s service-worker idle timer.
+setTaskKeepAlive(() => {
+  api.runtime.getPlatformInfo?.().catch?.(() => {});
+});
 
 api.runtime.onInstalled.addListener(async () => {
   const existing = await api.storage.sync.get(Object.keys(DEFAULT_SETTINGS));

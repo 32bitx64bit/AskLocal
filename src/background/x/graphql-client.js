@@ -1,5 +1,8 @@
 import { api } from "../api.js";
 import {
+  withLane
+} from "../orchestrator/tasks.js";
+import {
   X_BEARER_RE,
   X_GRAPHQL_ENDPOINT,
   X_GRAPHQL_PAGE_FETCH_TIMEOUT_MS
@@ -35,6 +38,9 @@ export async function requestXGraphQL(context, operationName, variables) {
     }
   };
 
+  return withLane("x", () => sendXGraphQL(context, operationName, variables, request), context.abortSignal);
+}
+async function sendXGraphQL(context, operationName, variables, request) {
   let result;
   try {
     result = await fetchXGraphQLFromBackground(request, context.abortSignal);

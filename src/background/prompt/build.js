@@ -237,7 +237,12 @@ export function createMediaNotes(context, caps = {}) {
 
   const describe = (item, primary) => {
     const alt = item.altText ? ` (alt text: "${oneLine(item.altText, 160)}")` : "";
-    const head = `↳ ${item.mediaType} ${item.id}${alt}`;
+    // Media re-posted from someone else's post: say whose it originally was, so the
+    // model does not credit the clip's content to the person who shared it.
+    const origin = item.sourceHandle && item.sourceHandle.toLowerCase() !== String(item.authorHandle || "").toLowerCase()
+      ? ` (originally posted by @${item.sourceHandle})`
+      : "";
+    const head = `↳ ${item.mediaType} ${item.id}${origin}${alt}`;
     const read = analysisByAlias.get(item.id);
     shown.add(item.id);
     if (!read) return `${head}: not analyzed`;
